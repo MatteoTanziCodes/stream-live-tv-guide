@@ -9,8 +9,12 @@
 //   CF_ACCOUNT_ID         — the Cloudflare account that owns the worker
 //   CF_KV_NAMESPACE_ID    — the id of the CHANNEL_STATE KV namespace
 //   CF_API_TOKEN          — API token with "Workers KV Storage: Edit" scope
+//   DEBRIDIO_TOKEN        — your Debridio token (from tv.lb.debridio.com/<TOKEN>/manifest.json)
+//                           used to fetch the live Debridio CA+USA channel catalog;
+//                           falls back to the hardcoded channels.ts if not set or fetch fails.
 
 import { buildBlob, KV_STATE_KEY } from "../src/kvcache";
+import { fetchDebridioChannels } from "../src/debridio";
 
 async function putToKV(
   accountId: string,
@@ -66,14 +70,42 @@ async function main() {
   const namespaceId = requireEnv("CF_KV_NAMESPACE_ID");
   const apiToken = requireEnv("CF_API_TOKEN");
 
+  // Attempt to fetch the live Debridio channel catalog. This keeps coverage
+  // up to date when Debridio adds or removes channels — no manual channels.ts
+  // edits required. Falls back to the hardcoded list if the token is absent
+  // or the catalog fetch fails (so existing refreshes keep working during
+  // any Debridio outage).
+  const debridioToken = process.env.DEBRIDIO_TOKEN;
+  let dynamicChannels: Awaited<ReturnType<typeof fetchDebridioChannels>>["channels"] | undefined;
+
+  if (debridioToken) {
+    console.log("[refresh-kv] fetching Debridio channel catalog…");
+    const result = await fetchDebridioChannels(debridioToken);
+    if (result.completenessErrors.length > 0) {
+      console.warn("[refresh-kv] Debridio catalog completeness errors:");
+      for (const e of result.completenessErrors) console.warn(`  - ${e}`);
+    }
+    if (result.channels.length > 0) {
+      dynamicChannels = result.channels;
+      console.log(
+        `[refresh-kv] using dynamic catalog: ${result.channels.length} channels ` +
+          `(CA: ${result.channels.filter(c => c.country === "ca").length}, ` +
+          `USA: ${result.channels.filter(c => c.country === "usa").length})`
+      );
+    } else {
+      console.warn("[refresh-kv] dynamic catalog returned 0 channels — falling back to hardcoded list");
+    }
+  } else {
+    console.log("[refresh-kv] DEBRIDIO_TOKEN not set — using hardcoded channels.ts fallback");
+  }
+
   console.log("[refresh-kv] building blob from epg.pw feeds…");
-  const blob = await buildBlob();
+  const blob = await buildBlob(dynamicChannels);
   const body = JSON.stringify(blob);
 
   console.log(
     `[refresh-kv] blob ready: ${body.length} bytes, ` +
-      `${blob.report.matched}/${blob.report.debridioChannelCount} Debridio channels matched, ` +
-      `${blob.report.indexKeys} alias keys`
+      `${blob.report.matched}/${blob.report.debridioChannelCount} Debridio channels matched`
   );
 
   // Hard-fail if completeness looked bad. The GitHub Actions run will go red
