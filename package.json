@@ -1,0 +1,19 @@
+{
+  "name": "stream-live-tv-guide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker that proxies Debridio TV and injects live 'now playing' descriptions for Canadian and US channels, sourced from epg.pw XMLTV feeds. Multi-tenant: each user supplies their own Debridio token in the URL.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.99.0"
+  }
+}

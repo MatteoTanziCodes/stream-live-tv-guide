@@ -1,0 +1,144 @@
+// Request-time lookup + blurb construction.
+//
+// The design: every channel (both Debridio-side and epg.pw-side) produces a
+// set of normalized "alias" keys. When we refresh KV, we write the same
+// ChannelState under every alias we can derive from the Debridio channel's
+// name/id/tvgId. At request time, we derive aliases from the incoming item the
+// same way and look them up directly. This keeps the request path O(1) per
+// alias and avoids running matching logic on the hot path.
+
+import { ChannelState } from "./types";
+
+export interface ItemLike {
+  id?: string;
+  name?: string;
+  tvgId?: string;
+}
+
+// Produce a single canonical lookup key from a raw name fragment.
+// "TSN 1" / "TSN-1" / "tsn1" all collapse to "tsn1". "A&E" → "aande".
+function normalize(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+// Generate plausible spelling variants of a name, before normalization.
+// Each variant feeds into `normalize()` to form an alias. The goal is for
+// "Disney Jr." (Debridio) and "Disney Junior" (epg.pw) to share at least one
+// normalized key — we don't need them to be equal, just to intersect.
+function variantsOf(raw: string): string[] {
+  const v = new Set<string>([raw]);
+  // Drop any parenthesised suffix: "Sportsnet (East)" → "Sportsnet".
+  v.add(raw.replace(/\s*\([^)]*\)\s*/g, " "));
+  // Drop HD/SD-style markers: "ABC HD" → "ABC".
+  v.add(raw.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, ""));
+  // Drop both at once.
+  v.add(
+    raw
+      .replace(/\s*\([^)]*\)\s*/g, " ")
+      .replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "")
+  );
+  // Bidirectional Jr <-> Junior — different feeds prefer different forms.
+  v.add(raw.replace(/\bJr\.?\b/gi, "Junior"));
+  v.add(raw.replace(/\bJunior\b/gi, "Jr"));
+  return [...v];
+}
+
+// Full alias set for a single raw name. Used on BOTH sides of the match
+// (Debridio-side when building the index, and epg.pw-side when ingesting
+// display-names).
+export function aliasesFor(raw: string): string[] {
+  const keys = variantsOf(raw)
+    .map(normalize)
+    .filter(k => k.length > 0);
+  return [...new Set(keys)];
+}
+
+// Produce aliases for a Debridio item, in priority order: most-specific first.
+// Most-specific = includes country suffix or full id, so colliding channels
+// between CA and USA (e.g. "Love Nature" exists in both) still resolve to the
+// right state when the Debridio client passes us tvgId or id.
+export function debridioAliases(item: ItemLike): string[] {
+  const lists: string[][] = [];
+  if (item.tvgId) {
+    // Full tvgId like "Love Nature.ca" → "lovenatureca" (country-specific)
+    lists.push(aliasesFor(item.tvgId));
+    const bare = item.tvgId.replace(/\.[a-z]+$/i, "");
+    if (bare !== item.tvgId) lists.push(aliasesFor(bare));
+  }
+  if (item.id) {
+    // Full id like "debtv:usa-lovenature" → "debtvusalovenature"
+    lists.push(aliasesFor(item.id));
+    const afterColon = item.id.split(":").pop() ?? item.id;
+    const afterDash = afterColon.includes("-")
+      ? afterColon.split("-").slice(1).join("-")
+      : afterColon;
+    if (afterDash !== item.id) lists.push(aliasesFor(afterDash));
+  }
+  if (item.name) lists.push(aliasesFor(item.name));
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const list of lists) {
+    for (const a of list) {
+      if (!seen.has(a)) {
+        seen.add(a);
+        out.push(a);
+      }
+    }
+  }
+  return out;
+}
+
+// Look up the ChannelState for an incoming Debridio item. Tries aliases in
+// priority order; first hit wins. Returns undefined for anything we can't
+// identify — in that case the worker leaves the item's description untouched.
+export function findChannelState(
+  item: ItemLike,
+  states: Record<string, ChannelState>
+): ChannelState | undefined {
+  for (const a of debridioAliases(item)) {
+    const s = states[a];
+    if (s) return s;
+  }
+  return undefined;
+}
+
+// Build the Stremio-facing "Now: … • Next: …" blurb from a channel state.
+// Does request-time staleness correction: if the cached "current" programme
+// has already ended, fall through to the cached "next". Bounds the worst-case
+// staleness to the next refresh cycle even if the cron is late.
+export function blurbFor(state: ChannelState | undefined): string | undefined {
+  if (!state) return undefined;
+  const nowMs = Date.now();
+  let cur = state.current;
+  let nxt = state.next;
+
+  // Drop expired current.
+  if (cur && new Date(cur.stop).getTime() <= nowMs) cur = undefined;
+  // Promote next to current if it has already started.
+  if (!cur && nxt && new Date(nxt.start).getTime() <= nowMs) {
+    if (new Date(nxt.stop).getTime() > nowMs) {
+      cur = nxt;
+      nxt = undefined;
+    } else {
+      // Even next has expired — nothing fresh to say.
+      nxt = undefined;
+    }
+  }
+
+  if (cur) {
+    const curPart = cur.description
+      ? `Now: ${cur.title} — ${cur.description}`
+      : `Now: ${cur.title}`;
+    return nxt ? `${curPart} • Next: ${nxt.title}` : curPart;
+  }
+  if (nxt) {
+    return nxt.description
+      ? `Up next: ${nxt.title} — ${nxt.description}`
+      : `Up next: ${nxt.title}`;
+  }
+  return undefined;
+}

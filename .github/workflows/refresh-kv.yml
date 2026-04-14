@@ -1,0 +1,42 @@
+name: Refresh EPG to Cloudflare KV
+
+# Re-fetches the epg.pw CA + US XMLTV feeds, rebuilds the Debridio-channel
+# match index, and PUTs the combined blob to Cloudflare KV. Runs on a 15-min
+# cron instead of 10-min because GitHub's scheduled runs routinely skew by
+# several minutes under load; a tighter cadence wouldn't actually get closer
+# to "live". The worker reads the KV key every request, so freshness only
+# affects how current the "Now:…"/"Up next:…" strings are.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# Prevent overlapping runs from racing on the KV key. If a run is still going
+# when the next cron fires, the later run waits or is skipped.
+concurrency:
+  group: refresh-kv
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # We don't commit a lockfile (see .gitignore), so `npm ci` doesn't work.
+      # `npm install --no-audit --no-fund` keeps the install quiet and fast.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build blob + push to KV
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: npx tsx scripts/refresh-kv.ts

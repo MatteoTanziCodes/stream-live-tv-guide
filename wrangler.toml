@@ -1,0 +1,22 @@
+name = "stream-live-tv-guide"
+main = "src/worker.ts"
+compatibility_date = "2024-12-01"
+
+# Enable the default <worker-name>.<account>.workers.dev URL for easy install into Stremio.
+workers_dev = true
+
+# Capture console.log / console.error in the dashboard so we can debug scrapes.
+[observability]
+enabled = true
+
+# KV namespace holding matched channel state. Populated by GitHub Actions
+# (see .github/workflows/refresh-kv.yml), read on every request here. One key
+# (`states:v2`) holds the full alias index + match report as a single JSON blob.
+#
+# No cron trigger is configured: the US epg.pw feed is ~200MB decoded and
+# parsing it doesn't fit in the free-plan 10ms CPU limit per invocation. The
+# GitHub Actions workflow runs the same pipeline on a full Node runner every
+# 15 minutes and PUTs the result to this KV key via the Cloudflare REST API.
+[[kv_namespaces]]
+binding = "CHANNEL_STATE"
+id = "b675b7089a7644a4a9ae7eb91be22b66"
