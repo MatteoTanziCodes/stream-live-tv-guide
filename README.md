@@ -20,7 +20,7 @@ https://tv.lb.debridio.com/<your-long-base64-token>/manifest.json
 Take the `<your-long-base64-token>` portion, then install this in Stremio instead:
 
 ```
-https://stream-live-tv-guide.matteo-beatstanzi.workers.dev/<your-long-base64-token>/manifest.json
+https://stream-live-tv-guide.matteo-tanzi.dev/<your-long-base64-token>/manifest.json
 ```
 
 That's it. Descriptions refresh automatically every 15 minutes.

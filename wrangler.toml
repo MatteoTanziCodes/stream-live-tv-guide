@@ -2,8 +2,12 @@ name = "stream-live-tv-guide"
 main = "src/worker.ts"
 compatibility_date = "2024-12-01"
 
-# Enable the default <worker-name>.<account>.workers.dev URL for easy install into Stremio.
-workers_dev = true
+# Publish on the matteo-tanzi.dev zone instead of the account workers.dev hostname.
+workers_dev = false
+
+[[routes]]
+pattern = "stream-live-tv-guide.matteo-tanzi.dev"
+custom_domain = true
 
 # Capture console.log / console.error in the dashboard so we can debug scrapes.
 [observability]
