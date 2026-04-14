@@ -131,8 +131,8 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
   }
 
   const result = parseRequestUrl(url);
-  if (result.kind === "landing") return landingPage();
-  if (result.kind === "badToken") return badTokenPage(result.reason);
+  if (result.kind === "landing") return landingPage(url.host);
+  if (result.kind === "badToken") return badTokenPage(result.reason, url.host);
 
   const base = (env.DEBRIDIO_BASE || DEBRIDIO_BASE_DEFAULT).replace(/\/+$/, "");
   const target = `${base}/${result.token}${result.forwardPath}${url.search}`;
@@ -184,7 +184,7 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
   });
 }
 
-function badTokenPage(reason: "not-base64" | "too-short" | "no-stremio-path"): Response {
+function badTokenPage(reason: "not-base64" | "too-short" | "no-stremio-path", host: string): Response {
   const hint = {
     "not-base64":
       "The URL segment after this worker's hostname isn't a valid Debridio token. Debridio tokens are long base64 strings that start with <code>eyJ</code> — they're the whole base64 blob in your Debridio URL between <code>debridio.com/</code> and <code>/manifest.json</code>, not the api_key value inside.",
@@ -207,7 +207,7 @@ function badTokenPage(reason: "not-base64" | "too-short" | "no-stremio-path"): R
 <h1>Invalid URL</h1>
 <div class="box">${hint}</div>
 <h2>Correct shape</h2>
-<p><code>https://<em>this-worker</em>/<strong>&lt;long-base64-token&gt;</strong>/manifest.json</code></p>
+<p><code>https://${host}/<strong>&lt;long-base64-token&gt;</strong>/manifest.json</code></p>
 <p class="muted">The token is the whole base64 string from your Debridio URL — the part between <code>tv.lb.debridio.com/</code> and <code>/manifest.json</code>. It starts with <code>eyJ</code> and is usually 200–400 characters.</p>
 </body></html>`;
   return new Response(html, {
@@ -216,7 +216,7 @@ function badTokenPage(reason: "not-base64" | "too-short" | "no-stremio-path"): R
   });
 }
 
-function landingPage(): Response {
+function landingPage(host: string): Response {
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -244,7 +244,7 @@ function landingPage(): Response {
   </li>
   <li>Take the long base64 token (the part between <code>debridio.com/</code> and <code>/manifest.json</code>).</li>
   <li>Install this URL instead, replacing <code>TOKEN</code> with your real token:
-    <div class="box"><code>https://<em>this-worker-host</em>/<strong>TOKEN</strong>/manifest.json</code></div>
+    <div class="box"><code>https://${host}/<strong>TOKEN</strong>/manifest.json</code></div>
   </li>
   <li>All supported Canadian and US channels will now show <strong>"Now:…"</strong> and <strong>"Up next:…"</strong> descriptions. Unmatched channels pass through unchanged.</li>
 </ol>
