@@ -11,7 +11,7 @@
 import { DEBRIDIO_CHANNELS } from "./channels";
 import { fetchAndParseXmltv, ParsedProgramme } from "./epgpw";
 import { aliasesFor, debridioAliases } from "./matcher";
-import { CachedBlob, ChannelState, MatchReport, Program } from "./types";
+import { CachedBlob, ChannelState, DebridioChannel, MatchReport, Program } from "./types";
 
 // v2: format changed from `Record<id, StoredState>` (tvpassport era) to
 // `{ report, states }` (epg.pw era). Bumping the key forces a clean slate
@@ -59,8 +59,12 @@ function toProgram(p: ParsedProgramme): Program {
 // peak live memory low). Match every Debridio channel against the combined
 // epg.pw data and build the CachedBlob. Produces a detailed MatchReport so
 // /__status can surface exactly what happened during the refresh.
-export async function buildBlob(): Promise<CachedBlob> {
+//
+// If `channels` is provided (fetched dynamically from Debridio at cron time),
+// it is used in place of the hardcoded DEBRIDIO_CHANNELS fallback.
+export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlob> {
   const startMs = Date.now();
+  const debridioChannels = channels && channels.length > 0 ? channels : DEBRIDIO_CHANNELS;
 
   const ca = await fetchAndParseXmltv(EPG_URLS.ca, "epg.pw CA");
   const us = await fetchAndParseXmltv(EPG_URLS.usa, "epg.pw US");
@@ -97,7 +101,7 @@ export async function buildBlob(): Promise<CachedBlob> {
   let matchedWithOnlyNext = 0;
   let matchedWithNothing = 0;
 
-  for (const ch of DEBRIDIO_CHANNELS) {
+  for (const ch of debridioChannels) {
     const debAliases = debridioAliases({ id: ch.id, name: ch.name, tvgId: ch.tvgId });
 
     // Find the best match. Preference order: same-country first, then other.
@@ -139,16 +143,17 @@ export async function buildBlob(): Promise<CachedBlob> {
       current: current ? toProgram(current) : undefined,
       next: next ? toProgram(next) : undefined,
     };
-    for (const a of debAliases) {
-      states[a] = state;
-    }
+    // Primary key: the canonical Debridio id (e.g. "debtv:ca-tsn1").
+    // This is what Debridio sends as `item.id` in catalog/meta responses, so
+    // request-time lookup is a single O(1) map hit instead of scanning aliases.
+    states[ch.id] = state;
   }
 
   const report: MatchReport = {
     refreshedAt: new Date().toISOString(),
     durationMs: Date.now() - startMs,
     sources: [ca.stats, us.stats],
-    debridioChannelCount: DEBRIDIO_CHANNELS.length,
+    debridioChannelCount: debridioChannels.length,
     matched,
     matchedWithCurrent,
     matchedWithOnlyNext,

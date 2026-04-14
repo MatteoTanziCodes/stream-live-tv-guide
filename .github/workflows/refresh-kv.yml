@@ -39,4 +39,10 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          # Optional but strongly recommended: fetches the live Debridio channel
+          # catalog at refresh time so coverage auto-updates when Debridio adds
+          # or removes channels. Without it, the hardcoded channels.ts is used.
+          # Value = the base64 token from your Debridio URL
+          # (the part between tv.lb.debridio.com/ and /manifest.json).
+          DEBRIDIO_TOKEN: ${{ secrets.DEBRIDIO_TOKEN }}
         run: npx tsx scripts/refresh-kv.ts

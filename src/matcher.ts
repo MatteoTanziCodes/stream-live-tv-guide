@@ -92,13 +92,19 @@ export function debridioAliases(item: ItemLike): string[] {
   return out;
 }
 
-// Look up the ChannelState for an incoming Debridio item. Tries aliases in
-// priority order; first hit wins. Returns undefined for anything we can't
-// identify — in that case the worker leaves the item's description untouched.
+// Look up the ChannelState for an incoming Debridio item.
+// Primary path: exact match on item.id (the canonical Debridio id like
+// "debtv:ca-tsn1"). O(1) map hit — covers ~100% of real Debridio responses.
+// Fallback: alias scan for tvgId-only items or any future id format changes.
 export function findChannelState(
   item: ItemLike,
   states: Record<string, ChannelState>
 ): ChannelState | undefined {
+  if (item.id) {
+    const direct = states[item.id];
+    if (direct) return direct;
+  }
+  // Alias fallback: handles items that arrive without a canonical id.
   for (const a of debridioAliases(item)) {
     const s = states[a];
     if (s) return s;
