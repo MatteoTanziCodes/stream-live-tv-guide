@@ -1,0 +1,21 @@
+{
+  "name": "stream-live-tv-guide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker that proxies Debridio TV and injects live 'now playing' descriptions scraped from tvpassport.com. Multi-tenant: each user supplies their own Debridio token in the URL.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "luxon": "^3.4.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "@types/luxon": "^3.4.2",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.99.0"
+  }
+}

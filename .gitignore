@@ -137,3 +137,62 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Cloudflare Workers / wrangler
+.wrangler/
+.dev.vars
+wrangler.toml.bak
+
+# Editor backup files
+*~
+*.un~
+
+# Claude Code worktrees / state
+.claude/
+
+
+# IPTV / playlist / EPG local files
+
+*.m3u
+
+*.m3u8
+
+*.xmltv
+
+*.epg.xml
+
+*.xml.gz
+
+data/
+
+cache/
+
+
+
+# secrets / scraped sources
+
+playlists/
+
+epg/
+
+secrets/
+
+private/
+
+
+
+# test output
+
+junit.xml
+
+.nyc_output/
+
+
+
+# optional lockfiles to ignore only if you intentionally do not want them committed
+
+package-lock.json
+
+yarn.lock
+
+pnpm-lock.yaml

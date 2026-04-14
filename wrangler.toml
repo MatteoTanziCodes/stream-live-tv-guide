@@ -1,0 +1,20 @@
+name = "stream-live-tv-guide"
+main = "src/worker.ts"
+compatibility_date = "2024-12-01"
+
+# Enable the default <worker-name>.<account>.workers.dev URL for easy install into Stremio.
+workers_dev = true
+
+# Capture console.log / console.error in the dashboard so we can debug scrapes.
+[observability]
+enabled = true
+
+# KV namespace holding scraped channel state. Populated by the scheduled handler,
+# read on every request. One key (`states:v1`) holds all 5 TSN channel states as JSON.
+[[kv_namespaces]]
+binding = "CHANNEL_STATE"
+id = "b675b7089a7644a4a9ae7eb91be22b66"
+
+# Re-scrape tvpassport.com every 10 minutes. Cron is in UTC.
+[triggers]
+crons = ["*/10 * * * *"]
