@@ -39,17 +39,43 @@ function rewriteBody(data: unknown, states: ChannelState[]): unknown {
 // URL shape:
 //   https://<worker>/<debridio-token>/<stremio-path>[?query]
 // The token is the full base64 config segment from the user's Debridio URL.
-// If the first path segment isn't long enough to plausibly be a token, we treat
-// it as "no token present" and serve the landing page.
-function parseRequestUrl(url: URL): { token: string; forwardPath: string } | null {
-  const segments = url.pathname.split("/").filter(Boolean);
-  if (segments.length === 0) return null;
-  const [token, ...rest] = segments;
-  // Debridio tokens are base64-encoded JSON configs ~200+ chars. Anything under
-  // 40 chars is almost certainly not a token — probably someone hitting /manifest.json
-  // directly or a bot. Show the landing page instead.
-  if (token.length < 40) return null;
-  return { token, forwardPath: "/" + rest.join("/") };
+// Every Debridio token is base64-encoded JSON starting with `{`, which encodes to `eyJ`.
+// We use that prefix as a sanity check and show helpful errors for common mistakes.
+const DEBRIDIO_TOKEN_PREFIX = "eyJ";
+const STREMIO_PATH_MARKERS = ["manifest.json", "catalog/", "meta/", "stream/", "configure"];
+
+type UrlResult =
+  | { kind: "ok"; token: string; forwardPath: string }
+  | { kind: "landing" }
+  | { kind: "badToken"; reason: "not-base64" | "too-short" | "no-stremio-path" };
+
+function parseRequestUrl(url: URL): UrlResult {
+  const pathname = url.pathname.replace(/^\/+/, "");
+  if (!pathname) return { kind: "landing" };
+
+  let token: string;
+  let forwardPath: string;
+
+  const slashIdx = pathname.indexOf("/");
+  if (slashIdx > 0) {
+    token = pathname.slice(0, slashIdx);
+    forwardPath = "/" + pathname.slice(slashIdx + 1);
+  } else {
+    // No `/` in the path. Common mistake: user pasted `.../TOKENmanifest.json` without
+    // a separator. Try to find a Stremio path marker and split at its start.
+    let markerIdx = -1;
+    for (const marker of STREMIO_PATH_MARKERS) {
+      const idx = pathname.indexOf(marker);
+      if (idx > 0 && (markerIdx === -1 || idx < markerIdx)) markerIdx = idx;
+    }
+    if (markerIdx < 0) return { kind: "badToken", reason: "no-stremio-path" };
+    token = pathname.slice(0, markerIdx);
+    forwardPath = "/" + pathname.slice(markerIdx);
+  }
+
+  if (!token.startsWith(DEBRIDIO_TOKEN_PREFIX)) return { kind: "badToken", reason: "not-base64" };
+  if (token.length < 40) return { kind: "badToken", reason: "too-short" };
+  return { kind: "ok", token, forwardPath };
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -70,11 +96,12 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  const parsed = parseRequestUrl(url);
-  if (!parsed) return landingPage();
+  const result = parseRequestUrl(url);
+  if (result.kind === "landing") return landingPage();
+  if (result.kind === "badToken") return badTokenPage(result.reason);
 
   const base = (env.DEBRIDIO_BASE || DEBRIDIO_BASE_DEFAULT).replace(/\/+$/, "");
-  const target = `${base}/${parsed.token}${parsed.forwardPath}${url.search}`;
+  const target = `${base}/${result.token}${result.forwardPath}${url.search}`;
 
   let upstream: Response;
   try {
@@ -86,7 +113,7 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
       },
     });
   } catch (err) {
-    console.error(`[proxy] upstream fetch failed for ${parsed.forwardPath}:`, (err as Error).message);
+    console.error(`[proxy] upstream fetch failed for ${result.forwardPath}:`, (err as Error).message);
     return new Response(
       JSON.stringify({ error: "upstream error", detail: (err as Error).message }),
       { status: 502, headers: { "content-type": "application/json", ...CORS_HEADERS } }
@@ -120,6 +147,38 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
   return new Response(buf, {
     status: upstream.status,
     headers: { "content-type": ct, ...CORS_HEADERS },
+  });
+}
+
+function badTokenPage(reason: "not-base64" | "too-short" | "no-stremio-path"): Response {
+  const hint = {
+    "not-base64":
+      "The URL segment after this worker's hostname isn't a valid Debridio token. Debridio tokens are long base64 strings that start with <code>eyJ</code> — they're the whole base64 blob in your Debridio URL between <code>debridio.com/</code> and <code>/manifest.json</code>, not the api_key value inside.",
+    "too-short":
+      "The token in your URL is too short to be a Debridio token. You probably pasted the api_key (the 32-character hex string inside the token) instead of the full base64 token. Use the whole base64 blob that starts with <code>eyJ</code>.",
+    "no-stremio-path":
+      "The URL is missing the Stremio path (e.g. <code>/manifest.json</code>). Make sure your URL ends with <code>/manifest.json</code> — with a slash between the token and <code>manifest.json</code>.",
+  }[reason];
+
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>stream-live-tv-guide — invalid URL</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; color: #1a1a1a; }
+  code { background: #f3f3f3; padding: 0.1em 0.35em; border-radius: 4px; word-break: break-all; }
+  .box { background: #fef6e4; border-left: 3px solid #f0a640; padding: 0.9rem 1.1rem; border-radius: 6px; margin: 1rem 0; }
+  .muted { color: #666; }
+</style></head>
+<body>
+<h1>Invalid URL</h1>
+<div class="box">${hint}</div>
+<h2>Correct shape</h2>
+<p><code>https://<em>this-worker</em>/<strong>&lt;long-base64-token&gt;</strong>/manifest.json</code></p>
+<p class="muted">The token is the whole base64 string from your Debridio URL — the part between <code>tv.lb.debridio.com/</code> and <code>/manifest.json</code>. It starts with <code>eyJ</code> and is usually 200–400 characters.</p>
+</body></html>`;
+  return new Response(html, {
+    status: 400,
+    headers: { "content-type": "text/html; charset=utf-8", ...CORS_HEADERS },
   });
 }
 
