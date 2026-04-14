@@ -13,10 +13,16 @@ import { fetchAndParseXmltv, ParsedProgramme } from "./epgpw";
 import { aliasesFor, debridioAliases } from "./matcher";
 import { CachedBlob, ChannelState, DebridioChannel, MatchReport, Program } from "./types";
 
-// v2: format changed from `Record<id, StoredState>` (tvpassport era) to
-// `{ report, states }` (epg.pw era). Bumping the key forces a clean slate
-// rather than silently mis-parsing a legacy blob on the first deploy.
-export const KV_STATE_KEY = "states:v2";
+// v3: ChannelState.current/next replaced with programmes[] window (4h back,
+// 6h ahead). blurbFor() now scans the window at request time so it's always
+// current — not a stale snapshot. Bumping the key forces a clean slate.
+export const KV_STATE_KEY = "states:v3";
+
+// How far back / ahead of refresh time to include programmes in the window.
+// Back: covers any long show that started before the cron fired.
+// Ahead: covers enough future slots that even a late cron still has data.
+const WINDOW_BACK_MS  = 4 * 60 * 60 * 1000; // 4 hours
+const WINDOW_AHEAD_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 const EPG_URLS = {
   ca: "https://epg.pw/xmltv/epg_CA.xml",
@@ -130,18 +136,28 @@ export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlo
 
     const feedResult = best.feed === "ca" ? ca : us;
     const programmes = feedResult.programmesByChannel.get(best.channelId) ?? [];
+
+    // Reporting: snapshot current/next at refresh time for /__status coverage stats.
     const { current, next } = pickCurrentAndNext(programmes, startMs);
     if (current) matchedWithCurrent++;
     else if (next) matchedWithOnlyNext++;
     else matchedWithNothing++;
+
+    // Storage: collect all programmes in the window so blurbFor() can compute
+    // current/next accurately at any point during the refresh interval, not just
+    // at the moment the cron ran.
+    const windowStart = startMs - WINDOW_BACK_MS;
+    const windowEnd   = startMs + WINDOW_AHEAD_MS;
+    const windowProgrammes = programmes
+      .filter(p => p.stop.getTime() > windowStart && p.start.getTime() < windowEnd)
+      .map(toProgram);
 
     const displayName =
       feedResult.channelDisplayNames.get(best.channelId)?.[0] ?? best.channelId;
 
     const state: ChannelState = {
       displayName,
-      current: current ? toProgram(current) : undefined,
-      next: next ? toProgram(next) : undefined,
+      programmes: windowProgrammes,
     };
     // Primary key: the canonical Debridio id (e.g. "debtv:ca-tsn1").
     // This is what Debridio sends as `item.id` in catalog/meta responses, so

@@ -16,11 +16,13 @@ export interface Program {
   stop: string; // ISO 8601
 }
 
-// Current + next for a single matched channel.
+// Schedule window for a single matched channel.
+// Stores all programmes in a ~10-hour window around refresh time (4h back, 6h
+// ahead), sorted by start ASC. blurbFor() scans this at request time so it
+// always reflects the live clock — not a stale snapshot from the last cron.
 export interface ChannelState {
   displayName: string; // original epg.pw display name (for debugging)
-  current?: Program;
-  next?: Program;
+  programmes: Program[];
 }
 
 // Per-source stats — captured during every scheduled refresh so we can prove the

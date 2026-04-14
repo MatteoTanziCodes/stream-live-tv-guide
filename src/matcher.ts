@@ -7,7 +7,7 @@
 // same way and look them up directly. This keeps the request path O(1) per
 // alias and avoids running matching logic on the hot path.
 
-import { ChannelState } from "./types";
+import { ChannelState, Program } from "./types";
 
 export interface ItemLike {
   id?: string;
@@ -30,20 +30,36 @@ function normalize(s: string): string {
 // normalized key — we don't need them to be equal, just to intersect.
 function variantsOf(raw: string): string[] {
   const v = new Set<string>([raw]);
-  // Drop any parenthesised suffix: "Sportsnet (East)" → "Sportsnet".
-  v.add(raw.replace(/\s*\([^)]*\)\s*/g, " "));
-  // Drop HD/SD-style markers: "ABC HD" → "ABC".
-  v.add(raw.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, ""));
-  // Drop both at once.
-  v.add(
-    raw
-      .replace(/\s*\([^)]*\)\s*/g, " ")
-      .replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "")
-  );
+
+  // Drop parenthesised qualifiers: "Sportsnet (East)" → "Sportsnet".
+  const noParens = raw.replace(/\s*\([^)]*\)\s*/g, " ").trim();
+  v.add(noParens);
+
+  // Drop resolution markers: "ABC HD" → "ABC".
+  const noRes = raw.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "").trim();
+  v.add(noRes);
+  v.add(noParens.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "").trim());
+
+  // Drop directional qualifiers: "Fox East" → "Fox", "ABC West" → "ABC".
+  // Feeds often append East/West for time-zone variants of the same network.
+  const noDir = raw.replace(/\b(?:East|West|Eastern|Western|North|South)\b/gi, "").trim();
+  v.add(noDir);
+  v.add(noDir.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "").trim());
+
+  // Drop generic medium words: "Fox News Channel" → "Fox News",
+  // "USA Network" → "USA", "CBC Television" → "CBC".
+  const noMedium = raw.replace(/\b(?:Channel|Network|Television)\b/gi, "").trim();
+  v.add(noMedium);
+  v.add(noMedium.replace(/\b(?:East|West|Eastern|Western|North|South)\b/gi, "").trim());
+
+  // Drop leading "The": "The CW" → "CW".
+  v.add(raw.replace(/^The\s+/i, "").trim());
+
   // Bidirectional Jr <-> Junior — different feeds prefer different forms.
   v.add(raw.replace(/\bJr\.?\b/gi, "Junior"));
   v.add(raw.replace(/\bJunior\b/gi, "Jr"));
-  return [...v];
+
+  return [...v].filter(s => s.length > 0);
 }
 
 // Full alias set for a single raw name. Used on BOTH sides of the match
@@ -113,25 +129,23 @@ export function findChannelState(
 }
 
 // Build the Stremio-facing "Now: … • Next: …" blurb from a channel state.
-// Does request-time staleness correction: if the cached "current" programme
-// has already ended, fall through to the cached "next". Bounds the worst-case
-// staleness to the next refresh cycle even if the cron is late.
+// Scans the stored programme window at request time so the result always
+// reflects the live clock — no stale snapshot from the last cron run.
 export function blurbFor(state: ChannelState | undefined): string | undefined {
-  if (!state) return undefined;
+  if (!state?.programmes?.length) return undefined;
   const nowMs = Date.now();
-  let cur = state.current;
-  let nxt = state.next;
+  let cur: Program | undefined;
+  let nxt: Program | undefined;
 
-  // Drop expired current.
-  if (cur && new Date(cur.stop).getTime() <= nowMs) cur = undefined;
-  // Promote next to current if it has already started.
-  if (!cur && nxt && new Date(nxt.start).getTime() <= nowMs) {
-    if (new Date(nxt.stop).getTime() > nowMs) {
-      cur = nxt;
-      nxt = undefined;
-    } else {
-      // Even next has expired — nothing fresh to say.
-      nxt = undefined;
+  // programmes[] is sorted ASC by start; early-exit once we pass now.
+  for (const p of state.programmes) {
+    const startMs = new Date(p.start).getTime();
+    const stopMs  = new Date(p.stop).getTime();
+    if (startMs <= nowMs && nowMs < stopMs) {
+      cur = p;
+    } else if (startMs > nowMs) {
+      nxt = p;
+      break;
     }
   }
 
