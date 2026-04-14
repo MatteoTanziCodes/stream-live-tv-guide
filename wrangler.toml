@@ -9,12 +9,14 @@ workers_dev = true
 [observability]
 enabled = true
 
-# KV namespace holding scraped channel state. Populated by the scheduled handler,
-# read on every request. One key (`states:v1`) holds all 5 TSN channel states as JSON.
+# KV namespace holding matched channel state. Populated by GitHub Actions
+# (see .github/workflows/refresh-kv.yml), read on every request here. One key
+# (`states:v2`) holds the full alias index + match report as a single JSON blob.
+#
+# No cron trigger is configured: the US epg.pw feed is ~200MB decoded and
+# parsing it doesn't fit in the free-plan 10ms CPU limit per invocation. The
+# GitHub Actions workflow runs the same pipeline on a full Node runner every
+# 15 minutes and PUTs the result to this KV key via the Cloudflare REST API.
 [[kv_namespaces]]
 binding = "CHANNEL_STATE"
 id = "b675b7089a7644a4a9ae7eb91be22b66"
-
-# Re-scrape tvpassport.com every 10 minutes. Cron is in UTC.
-[triggers]
-crons = ["*/10 * * * *"]

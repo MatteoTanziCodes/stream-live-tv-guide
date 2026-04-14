@@ -1,5 +1,5 @@
-import { blurbFor, findChannelForItem, ItemLike } from "./matcher";
-import { loadAllStates, refreshAllToKV } from "./kvcache";
+import { blurbFor, findChannelState, ItemLike } from "./matcher";
+import { loadAllStates, loadBlob } from "./kvcache";
 import { ChannelState } from "./types";
 
 // Where Debridio lives. Overridable via a var if they ever change host.
@@ -12,9 +12,9 @@ export interface Env {
 
 function enhanceItem<T extends ItemLike & { description?: string }>(
   item: T,
-  states: ChannelState[]
+  states: Record<string, ChannelState>
 ): T {
-  const state = findChannelForItem(item, states);
+  const state = findChannelState(item, states);
   const blurb = blurbFor(state);
   if (!blurb) return item;
   return { ...item, description: blurb };
@@ -24,7 +24,7 @@ function enhanceItem<T extends ItemLike & { description?: string }>(
 // Only touches `metas[]` (catalog response) and `meta` (single-meta response).
 // `streams[]` is intentionally left alone — Debridio's stream descriptions
 // ("A1X Media", "TVPass HD") are identifiers, not TV listings.
-function rewriteBody(data: unknown, states: ChannelState[]): unknown {
+function rewriteBody(data: unknown, states: Record<string, ChannelState>): unknown {
   if (!data || typeof data !== "object") return data;
   const obj = data as Record<string, unknown>;
   if (Array.isArray(obj.metas)) {
@@ -87,11 +87,45 @@ const CORS_HEADERS: Record<string, string> = {
 async function handleProxy(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
-  // Manual trigger for the scrape job. Harmless — it just re-fetches the same 5
-  // tvpassport pages the cron would fetch. Used to warm KV right after deploy.
+  // /__refresh used to trigger a synchronous re-scrape. It's been retired —
+  // the 200MB US epg.pw feed can't be parsed inside the free-plan Cloudflare
+  // Worker's 10ms CPU budget. Refreshes now come from a GitHub Action that
+  // runs the same pipeline on a full Node runner and PUTs the result to KV
+  // via the Cloudflare REST API (see .github/workflows/refresh-kv.yml).
   if (url.pathname === "/__refresh") {
-    await refreshAllToKV(env.CHANNEL_STATE);
-    return new Response(JSON.stringify({ ok: true, refreshedAt: new Date().toISOString() }), {
+    return new Response(
+      JSON.stringify(
+        {
+          error: "refresh runs in GitHub Actions, not in the worker",
+          howTo:
+            "Run the 'Refresh EPG to Cloudflare KV' workflow manually from the repo's Actions tab, or wait for the 15-min cron.",
+        },
+        null,
+        2
+      ),
+      { status: 410, headers: { "content-type": "application/json", ...CORS_HEADERS } }
+    );
+  }
+
+  // Coverage + completeness inspector. Returns the MatchReport from the last
+  // refresh. Missing KV blob → 503, meaning the GitHub Action hasn't run yet.
+  if (url.pathname === "/__status") {
+    const blob = await loadBlob(env.CHANNEL_STATE);
+    if (!blob) {
+      return new Response(
+        JSON.stringify(
+          {
+            error: "no refresh has completed yet",
+            howTo:
+              "Run the 'Refresh EPG to Cloudflare KV' GitHub Actions workflow once to populate KV, or wait for the 15-min cron.",
+          },
+          null,
+          2
+        ),
+        { status: 503, headers: { "content-type": "application/json", ...CORS_HEADERS } }
+      );
+    }
+    return new Response(JSON.stringify(blob.report, null, 2), {
       headers: { "content-type": "application/json", ...CORS_HEADERS },
     });
   }
@@ -201,7 +235,7 @@ function landingPage(): Response {
 </head>
 <body>
 <h1>stream-live-tv-guide</h1>
-<p class="muted">A proxy for the Debridio TV Stremio addon that fills in live "now playing" descriptions for TSN 1-5 (Canada), scraped from tvpassport.com.</p>
+<p class="muted">A proxy for the Debridio TV Stremio addon that fills in live "now playing" descriptions for Canadian and US TV channels, sourced from epg.pw XMLTV feeds.</p>
 
 <h2>How to install</h2>
 <ol>
@@ -212,11 +246,11 @@ function landingPage(): Response {
   <li>Install this URL instead, replacing <code>TOKEN</code> with your real token:
     <div class="box"><code>https://<em>this-worker-host</em>/<strong>TOKEN</strong>/manifest.json</code></div>
   </li>
-  <li>Your TSN 1-5 channels will now show <strong>"Now:…"</strong> and <strong>"Up next:…"</strong> descriptions. Other channels pass through unchanged.</li>
+  <li>All supported Canadian and US channels will now show <strong>"Now:…"</strong> and <strong>"Up next:…"</strong> descriptions. Unmatched channels pass through unchanged.</li>
 </ol>
 
-<h2>Privacy</h2>
-<p class="muted">Requests are proxied to Debridio and your token is visible in the URL. Don't use this if you don't want to share the token with whoever operates this instance. You can self-host from the source.</p>
+<h2>Status / debug</h2>
+<p>Call <code>/__status</code> on this worker to see the last refresh's coverage report (how many Debridio channels were matched against epg.pw data, completeness errors per feed, list of unmatched channels).</p>
 </body>
 </html>`;
   return new Response(html, {
@@ -224,18 +258,14 @@ function landingPage(): Response {
   });
 }
 
+// No scheduled() handler: refreshes are driven by GitHub Actions because the
+// US epg.pw feed (~200MB decoded) blows past the free plan's 10ms-per-invocation
+// CPU limit. The worker is a pure reader of a KV blob that the action owns.
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
     return handleProxy(request, env);
-  },
-
-  // Cron: scrape tvpassport and refresh the KV cache.
-  // Runs regardless of whether anyone has requested anything — fresh data is ready
-  // the moment a Stremio client asks.
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshAllToKV(env.CHANNEL_STATE));
   },
 };

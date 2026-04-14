@@ -1,25 +1,13 @@
-import { CHANNELS } from "./channels";
-import { Channel, ChannelState } from "./types";
+// Request-time lookup + blurb construction.
+//
+// The design: every channel (both Debridio-side and epg.pw-side) produces a
+// set of normalized "alias" keys. When we refresh KV, we write the same
+// ChannelState under every alias we can derive from the Debridio channel's
+// name/id/tvgId. At request time, we derive aliases from the incoming item the
+// same way and look them up directly. This keeps the request path O(1) per
+// alias and avoids running matching logic on the hot path.
 
-// "TSN 1" / "TSN-1" / "TSN1" / "debtv:ca-tsn1" → "tsn1"
-function normalize(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-// Strip common id prefixes like "debtv:ca-" to isolate the channel slug.
-function slugOfId(id: string): string {
-  const afterColon = id.split(":").pop() ?? id;
-  const afterDash = afterColon.includes("-") ? afterColon.split("-").slice(1).join("-") : afterColon;
-  return normalize(afterDash);
-}
-
-// Strip country suffix from tvgId (e.g. "TSN 1.ca" → "TSN 1").
-function bareTvg(tvg: string): string {
-  return tvg.replace(/\.[a-z]+$/i, "");
-}
-
-const INDEX = new Map<string, Channel>();
-for (const c of CHANNELS) INDEX.set(normalize(c.name), c);
+import { ChannelState } from "./types";
 
 export interface ItemLike {
   id?: string;
@@ -27,37 +15,120 @@ export interface ItemLike {
   tvgId?: string;
 }
 
-function stateFor(states: ChannelState[], channelId: string): ChannelState | undefined {
-  return states.find(s => s.channel.id === channelId);
+// Produce a single canonical lookup key from a raw name fragment.
+// "TSN 1" / "TSN-1" / "tsn1" all collapse to "tsn1". "A&E" → "aande".
+function normalize(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "");
 }
 
-// States are passed in rather than imported so the matcher stays pure and easy to test.
-// Order of match attempts: name → id-slug → tvgId.
-export function findChannelForItem(
-  item: ItemLike,
-  states: ChannelState[]
-): ChannelState | undefined {
-  if (item.name) {
-    const c = INDEX.get(normalize(item.name));
-    if (c) return stateFor(states, c.id);
+// Generate plausible spelling variants of a name, before normalization.
+// Each variant feeds into `normalize()` to form an alias. The goal is for
+// "Disney Jr." (Debridio) and "Disney Junior" (epg.pw) to share at least one
+// normalized key — we don't need them to be equal, just to intersect.
+function variantsOf(raw: string): string[] {
+  const v = new Set<string>([raw]);
+  // Drop any parenthesised suffix: "Sportsnet (East)" → "Sportsnet".
+  v.add(raw.replace(/\s*\([^)]*\)\s*/g, " "));
+  // Drop HD/SD-style markers: "ABC HD" → "ABC".
+  v.add(raw.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, ""));
+  // Drop both at once.
+  v.add(
+    raw
+      .replace(/\s*\([^)]*\)\s*/g, " ")
+      .replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "")
+  );
+  // Bidirectional Jr <-> Junior — different feeds prefer different forms.
+  v.add(raw.replace(/\bJr\.?\b/gi, "Junior"));
+  v.add(raw.replace(/\bJunior\b/gi, "Jr"));
+  return [...v];
+}
+
+// Full alias set for a single raw name. Used on BOTH sides of the match
+// (Debridio-side when building the index, and epg.pw-side when ingesting
+// display-names).
+export function aliasesFor(raw: string): string[] {
+  const keys = variantsOf(raw)
+    .map(normalize)
+    .filter(k => k.length > 0);
+  return [...new Set(keys)];
+}
+
+// Produce aliases for a Debridio item, in priority order: most-specific first.
+// Most-specific = includes country suffix or full id, so colliding channels
+// between CA and USA (e.g. "Love Nature" exists in both) still resolve to the
+// right state when the Debridio client passes us tvgId or id.
+export function debridioAliases(item: ItemLike): string[] {
+  const lists: string[][] = [];
+  if (item.tvgId) {
+    // Full tvgId like "Love Nature.ca" → "lovenatureca" (country-specific)
+    lists.push(aliasesFor(item.tvgId));
+    const bare = item.tvgId.replace(/\.[a-z]+$/i, "");
+    if (bare !== item.tvgId) lists.push(aliasesFor(bare));
   }
   if (item.id) {
-    const c = INDEX.get(slugOfId(item.id));
-    if (c) return stateFor(states, c.id);
+    // Full id like "debtv:usa-lovenature" → "debtvusalovenature"
+    lists.push(aliasesFor(item.id));
+    const afterColon = item.id.split(":").pop() ?? item.id;
+    const afterDash = afterColon.includes("-")
+      ? afterColon.split("-").slice(1).join("-")
+      : afterColon;
+    if (afterDash !== item.id) lists.push(aliasesFor(afterDash));
   }
-  if (item.tvgId) {
-    const c = INDEX.get(normalize(bareTvg(item.tvgId)));
-    if (c) return stateFor(states, c.id);
+  if (item.name) lists.push(aliasesFor(item.name));
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const list of lists) {
+    for (const a of list) {
+      if (!seen.has(a)) {
+        seen.add(a);
+        out.push(a);
+      }
+    }
+  }
+  return out;
+}
+
+// Look up the ChannelState for an incoming Debridio item. Tries aliases in
+// priority order; first hit wins. Returns undefined for anything we can't
+// identify — in that case the worker leaves the item's description untouched.
+export function findChannelState(
+  item: ItemLike,
+  states: Record<string, ChannelState>
+): ChannelState | undefined {
+  for (const a of debridioAliases(item)) {
+    const s = states[a];
+    if (s) return s;
   }
   return undefined;
 }
 
-// Build a Stremio-facing description blurb from a channel's current / next programs.
-// Falls back to "Up next:" when nothing is currently airing.
+// Build the Stremio-facing "Now: … • Next: …" blurb from a channel state.
+// Does request-time staleness correction: if the cached "current" programme
+// has already ended, fall through to the cached "next". Bounds the worst-case
+// staleness to the next refresh cycle even if the cron is late.
 export function blurbFor(state: ChannelState | undefined): string | undefined {
   if (!state) return undefined;
-  const cur = state.current;
-  const nxt = state.next;
+  const nowMs = Date.now();
+  let cur = state.current;
+  let nxt = state.next;
+
+  // Drop expired current.
+  if (cur && new Date(cur.stop).getTime() <= nowMs) cur = undefined;
+  // Promote next to current if it has already started.
+  if (!cur && nxt && new Date(nxt.start).getTime() <= nowMs) {
+    if (new Date(nxt.stop).getTime() > nowMs) {
+      cur = nxt;
+      nxt = undefined;
+    } else {
+      // Even next has expired — nothing fresh to say.
+      nxt = undefined;
+    }
+  }
+
   if (cur) {
     const curPart = cur.description
       ? `Now: ${cur.title} — ${cur.description}`
