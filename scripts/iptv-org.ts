@@ -25,13 +25,22 @@ interface IptvOrgChannelDef {
   sourceRank: number;
 }
 
+interface SelectedChannelDef extends IptvOrgChannelDef {
+  outputXmltvId: string;
+  outputName: string;
+}
+
 const REPO_DIR = path.join(os.tmpdir(), "iptv-org-epg");
 const GENERATED_DIR = path.join(os.tmpdir(), "stream-live-tv-guide-iptv-org");
 const GENERAL_SITE_FILES = [
-  "sites/tvguide.com/tvguide.com.channels.xml",
   "sites/tvtv.us/tvtv.us.channels.xml",
   "sites/directv.com/directv.com.channels.xml",
   "sites/tvpassport.com/tvpassport.com.channels.xml",
+  "sites/tvguide.com/tvguide.com.channels.xml",
+  "sites/tvinsider.com/tvinsider.com.channels.xml",
+  "sites/plex.tv/plex.tv_us.channels.xml",
+  "sites/pluto.tv/pluto.tv_us.channels.xml",
+  "sites/streamingtvguides.com/streamingtvguides.com.channels.xml",
   "sites/ontvtonight.com/ontvtonight.com_us.channels.xml",
   "sites/ontvtonight.com/ontvtonight.com_ca.channels.xml",
   "sites/tvhebdo.com/tvhebdo.com.channels.xml",
@@ -39,7 +48,11 @@ const GENERAL_SITE_FILES = [
 const SPORTS_SITE_FILES = [
   "sites/tvhebdo.com/tvhebdo.com.channels.xml",
   "sites/tvpassport.com/tvpassport.com.channels.xml",
+  "sites/plex.tv/plex.tv_ca.channels.xml",
+  "sites/plex.tv/plex.tv_us.channels.xml",
+  "sites/pluto.tv/pluto.tv_us.channels.xml",
   "sites/tvinsider.com/tvinsider.com.channels.xml",
+  "sites/streamingtvguides.com/streamingtvguides.com.channels.xml",
 ];
 const LANGUAGE_RE = /\b(?:English|French)\b/gi;
 const SPORTS_GAP_FILL_MS = 4 * 60 * 60 * 1000;
@@ -120,7 +133,6 @@ async function loadChannelDefs(
     const xml = await fs.readFile(sourcePath, "utf8");
     for (const match of xml.matchAll(re)) {
       const [, site, siteId, lang, xmltvId, nameRaw] = match;
-      if (!xmltvId.trim()) continue;
       defs.push({
         site,
         siteId,
@@ -165,8 +177,8 @@ function selectChannels(
   targets: TargetChannel[],
   defs: IptvOrgChannelDef[],
   options: SelectOptions = {}
-): Map<string, IptvOrgChannelDef> {
-  const selected = new Map<string, IptvOrgChannelDef>();
+): Map<string, SelectedChannelDef> {
+  const selected = new Map<string, SelectedChannelDef>();
   const defCache = new Map<IptvOrgChannelDef, Set<string>>();
 
   for (const ch of targets) {
@@ -204,11 +216,12 @@ function selectChannels(
         ...aliasesFor(xmltvBase.replace(LANGUAGE_RE, " ")),
       ]);
       const exactPrefix = [...xmltvPrefixes].some(alias => targetPrefixes.has(alias));
+      const exactName = aliasesFor(ch.name).some(alias => aliases.has(alias));
       const strongShared = sharedAliases.some(alias => alias.length >= 6);
-      if (!exactPrefix && !strongShared) continue;
+      if (!exactPrefix && !exactName && !strongShared) continue;
       const country = candidateCountry(def);
       const countryPenalty = country === ch.country ? 0 : country ? 50 : 100;
-      const exactPenalty = exactPrefix ? 0 : 10;
+      const exactPenalty = exactPrefix || exactName ? 0 : 10;
       const sitePenalty = options.sitePriority?.(ch, def) ?? 0;
       const score = countryPenalty + exactPenalty + def.sourceRank + sitePenalty;
 
@@ -219,21 +232,25 @@ function selectChannels(
     }
 
     if (best) {
-      selected.set(ch.id, best);
+      selected.set(ch.id, {
+        ...best,
+        outputXmltvId: canonicalTvgId(ch.tvgId),
+        outputName: ch.name,
+      });
     }
   }
 
   return selected;
 }
 
-async function writeChannelsXml(selected: Iterable<IptvOrgChannelDef>): Promise<string> {
+async function writeChannelsXml(selected: Iterable<SelectedChannelDef>): Promise<string> {
   await fs.mkdir(GENERATED_DIR, { recursive: true });
   const file = path.join(GENERATED_DIR, "channels.xml");
   const body = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     "<channels>",
     ...[...selected].map(def =>
-      `  <channel site="${escapeXml(def.site)}" site_id="${escapeXml(def.siteId)}" lang="${escapeXml(def.lang)}" xmltv_id="${escapeXml(def.xmltvId)}">${escapeXml(def.name)}</channel>`
+      `  <channel site="${escapeXml(def.site)}" site_id="${escapeXml(def.siteId)}" lang="${escapeXml(def.lang)}" xmltv_id="${escapeXml(def.outputXmltvId)}">${escapeXml(def.outputName)}</channel>`
     ),
     "</channels>",
     "",
@@ -288,15 +305,30 @@ function sportsSitePriority(target: TargetChannel, def: IptvOrgChannelDef): numb
   if (target.country === "ca") {
     if (def.site === "tvhebdo.com") return -20;
     if (def.site === "tvpassport.com") return 10;
+    if (def.site === "plex.tv") return -5;
     if (def.site === "tvinsider.com") return 30;
+    if (def.site === "pluto.tv") return 35;
+    if (def.site === "streamingtvguides.com") return 45;
   } else {
     if (def.site === "tvpassport.com") return -20;
+    if (def.site === "plex.tv") return -10;
+    if (def.site === "pluto.tv") return -5;
     if (def.site === "tvinsider.com") return 5;
     if (def.site === "tvhebdo.com") return 15;
+    if (def.site === "streamingtvguides.com") return 20;
   }
 
   if (/(sportsnet|tsn|game\+|the ocho)/i.test(name) && def.site === "tvhebdo.com") {
     return -40;
+  }
+  if (/(golazo|hq|abc news|ufc)/i.test(name) && def.site === "plex.tv") {
+    return -25;
+  }
+  if (/(hq|fox sports|ufc)/i.test(name) && def.site === "pluto.tv") {
+    return -15;
+  }
+  if (/(sny|willow xtra)/i.test(name) && def.site === "streamingtvguides.com") {
+    return -15;
   }
   if (/(espn|acc|sec|big ten|nba|nfl|nhl|mlb|golf|tennis|willow|tudn|msg|nesn|altitude|yes network|marquee|spectrum sportsnet|fan ?duel|tvg)/i.test(name) &&
       def.site === "tvpassport.com") {
