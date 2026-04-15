@@ -6,6 +6,7 @@ export interface DebridioChannel {
   name: string; // e.g. "TSN 1"
   tvgId: string; // e.g. "TSN 1.ca"
   country: "ca" | "usa";
+  genres?: string[];
 }
 
 // One programme (TV listing). Stored in KV as ISO strings, revived to Date on use.

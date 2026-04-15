@@ -11,6 +11,7 @@
 import { DEBRIDIO_CHANNELS } from "./channels";
 import { fetchAndParseXmltv, ParsedProgramme, XmltvResult } from "./epgpw";
 import { aliasesFor, debridioAliases } from "./matcher";
+import { isSportsChannel } from "./sports";
 import { CachedBlob, ChannelState, DebridioChannel, MatchReport, Program } from "./types";
 
 // v3: ChannelState.current/next replaced with programmes[] window (4h back,
@@ -30,6 +31,7 @@ const EPG_URLS = {
 } as const;
 
 interface FeedDescriptor {
+  kind: "primary" | "fallback" | "sports";
   countryHint?: "ca" | "usa";
   result: XmltvResult;
 }
@@ -37,6 +39,12 @@ interface FeedDescriptor {
 interface FeedCandidate {
   channelId: string;
   feedIndex: number;
+}
+
+export interface AdditionalGuideFeed {
+  kind?: "fallback" | "sports";
+  countryHint?: "ca" | "usa";
+  result: XmltvResult;
 }
 
 // Pick the current and next programmes for a sorted programme list.
@@ -80,7 +88,7 @@ function toProgram(p: ParsedProgramme): Program {
 // it is used in place of the hardcoded DEBRIDIO_CHANNELS fallback.
 export async function buildBlob(
   channels?: DebridioChannel[],
-  extraFeeds: XmltvResult[] = []
+  extraFeeds: AdditionalGuideFeed[] = []
 ): Promise<CachedBlob> {
   const startMs = Date.now();
   const debridioChannels = channels && channels.length > 0 ? channels : DEBRIDIO_CHANNELS;
@@ -88,9 +96,13 @@ export async function buildBlob(
   const ca = await fetchAndParseXmltv(EPG_URLS.ca, "epg.pw CA");
   const us = await fetchAndParseXmltv(EPG_URLS.usa, "epg.pw US");
   const feeds: FeedDescriptor[] = [
-    { countryHint: "ca", result: ca },
-    { countryHint: "usa", result: us },
-    ...extraFeeds.map(result => ({ result })),
+    { kind: "primary", countryHint: "ca", result: ca },
+    { kind: "primary", countryHint: "usa", result: us },
+    ...extraFeeds.map(feed => ({
+      kind: feed.kind ?? "fallback",
+      countryHint: feed.countryHint,
+      result: feed.result,
+    })),
   ];
 
   // Build the alias → candidate channels lookup table from all feeds.
@@ -127,6 +139,7 @@ export async function buildBlob(
   let matchedWithNothing = 0;
 
   for (const ch of debridioChannels) {
+    const sportsChannel = isSportsChannel(ch);
     const debAliases = debridioAliases({ id: ch.id, name: ch.name, tvgId: ch.tvgId });
 
     // Find the best match. Preference order: same-country first, then other.
@@ -143,7 +156,18 @@ export async function buildBlob(
         seenCandidates.add(dedupeKey);
 
         const feed = feeds[hit.feedIndex];
+        const programmes = feed.result.programmesByChannel.get(hit.channelId);
+        if (!programmes || programmes.length === 0) continue;
+        const kindPenalty =
+          feed.kind === "sports"
+            ? sportsChannel
+              ? -10_000
+              : 5_000
+            : feed.kind === "fallback"
+              ? 2_000
+              : 0;
         const score =
+          kindPenalty +
           (feed.countryHint === preferredFeed ? 0 : feed.countryHint ? 1 : 2) * 1000 +
           hit.feedIndex;
         if (score < bestScore) {

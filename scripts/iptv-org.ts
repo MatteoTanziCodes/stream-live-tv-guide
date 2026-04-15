@@ -5,6 +5,8 @@ import path from "node:path";
 
 import { parseXmltvText, XmltvResult } from "../src/epgpw";
 import { aliasesFor, debridioAliases } from "../src/matcher";
+import { isSportsChannel } from "../src/sports";
+import { DebridioChannel } from "../src/types";
 
 type UnmatchedChannel = {
   id: string;
@@ -25,7 +27,7 @@ interface IptvOrgChannelDef {
 
 const REPO_DIR = path.join(os.tmpdir(), "iptv-org-epg");
 const GENERATED_DIR = path.join(os.tmpdir(), "stream-live-tv-guide-iptv-org");
-const SITE_FILES = [
+const GENERAL_SITE_FILES = [
   "sites/tvguide.com/tvguide.com.channels.xml",
   "sites/tvtv.us/tvtv.us.channels.xml",
   "sites/directv.com/directv.com.channels.xml",
@@ -34,7 +36,25 @@ const SITE_FILES = [
   "sites/ontvtonight.com/ontvtonight.com_ca.channels.xml",
   "sites/tvhebdo.com/tvhebdo.com.channels.xml",
 ];
+const SPORTS_SITE_FILES = [
+  "sites/tvhebdo.com/tvhebdo.com.channels.xml",
+  "sites/tvpassport.com/tvpassport.com.channels.xml",
+  "sites/tvinsider.com/tvinsider.com.channels.xml",
+];
 const LANGUAGE_RE = /\b(?:English|French)\b/gi;
+const SPORTS_GAP_FILL_MS = 4 * 60 * 60 * 1000;
+
+type TargetChannel = Pick<DebridioChannel, "id" | "name" | "tvgId" | "country" | "genres">;
+
+interface SelectOptions {
+  sitePriority?: (target: TargetChannel, def: IptvOrgChannelDef) => number;
+}
+
+interface GrabOptions {
+  currDate?: string;
+  days?: number;
+  outputDir?: string;
+}
 
 function decodeEntities(s: string): string {
   return s
@@ -87,12 +107,15 @@ async function ensureRepo(): Promise<string> {
   return REPO_DIR;
 }
 
-async function loadChannelDefs(repoDir: string): Promise<IptvOrgChannelDef[]> {
+async function loadChannelDefs(
+  repoDir: string,
+  siteFiles: string[]
+): Promise<IptvOrgChannelDef[]> {
   const defs: IptvOrgChannelDef[] = [];
   const re =
     /<channel\s+site="([^"]+)"\s+site_id="([^"]+)"\s+lang="([^"]*)"\s+xmltv_id="([^"]*)">([\s\S]*?)<\/channel>/g;
 
-  for (const [sourceRank, relPath] of SITE_FILES.entries()) {
+  for (const [sourceRank, relPath] of siteFiles.entries()) {
     const sourcePath = path.join(repoDir, relPath);
     const xml = await fs.readFile(sourcePath, "utf8");
     for (const match of xml.matchAll(re)) {
@@ -139,13 +162,14 @@ function candidateCountry(def: IptvOrgChannelDef): "ca" | "usa" | undefined {
 }
 
 function selectChannels(
-  unmatched: UnmatchedChannel[],
-  defs: IptvOrgChannelDef[]
+  targets: TargetChannel[],
+  defs: IptvOrgChannelDef[],
+  options: SelectOptions = {}
 ): Map<string, IptvOrgChannelDef> {
   const selected = new Map<string, IptvOrgChannelDef>();
   const defCache = new Map<IptvOrgChannelDef, Set<string>>();
 
-  for (const ch of unmatched) {
+  for (const ch of targets) {
     const target = {
       id: ch.id,
       name: ch.name,
@@ -183,10 +207,10 @@ function selectChannels(
       const strongShared = sharedAliases.some(alias => alias.length >= 6);
       if (!exactPrefix && !strongShared) continue;
       const country = candidateCountry(def);
-      const countryPenalty =
-        country === ch.country ? 0 : country ? 50 : 100;
+      const countryPenalty = country === ch.country ? 0 : country ? 50 : 100;
       const exactPenalty = exactPrefix ? 0 : 10;
-      const score = countryPenalty + exactPenalty + def.sourceRank;
+      const sitePenalty = options.sitePriority?.(ch, def) ?? 0;
+      const score = countryPenalty + exactPenalty + def.sourceRank + sitePenalty;
 
       if (score < bestScore) {
         best = def;
@@ -218,15 +242,98 @@ async function writeChannelsXml(selected: Iterable<IptvOrgChannelDef>): Promise<
   return file;
 }
 
-async function runGrab(repoDir: string, channelsPath: string): Promise<string> {
-  await fs.mkdir(GENERATED_DIR, { recursive: true });
-  const guidePath = path.join(GENERATED_DIR, "guide.xml");
-  await exec(
-    "npm",
-    ["run", "grab", "---", `--channels=${channelsPath}`, `--output=${guidePath}`, "--days=1", "--maxConnections=4"],
-    repoDir
-  );
+async function runGrab(
+  repoDir: string,
+  channelsPath: string,
+  options: GrabOptions = {}
+): Promise<string> {
+  const outputDir = options.outputDir ?? GENERATED_DIR;
+  await fs.mkdir(outputDir, { recursive: true });
+  const guidePath = path.join(outputDir, "guide.xml");
+
+  const env = {
+    ...process.env,
+    ...(options.currDate ? { CURR_DATE: options.currDate } : {}),
+  };
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      "npm",
+      [
+        "run",
+        "grab",
+        "---",
+        `--channels=${channelsPath}`,
+        `--output=${guidePath}`,
+        `--days=${options.days ?? 1}`,
+        "--maxConnections=4",
+      ],
+      {
+        cwd: repoDir,
+        stdio: "inherit",
+        shell: process.platform === "win32",
+        env,
+      }
+    );
+    child.on("exit", code => {
+      if (code === 0) resolve();
+      else reject(new Error(`npm run grab failed with exit code ${code ?? "null"}`));
+    });
+    child.on("error", reject);
+  });
   return guidePath;
+}
+
+function sportsSitePriority(target: TargetChannel, def: IptvOrgChannelDef): number {
+  const name = `${target.name} ${target.tvgId}`.toLowerCase();
+  if (target.country === "ca") {
+    if (def.site === "tvhebdo.com") return -20;
+    if (def.site === "tvpassport.com") return 10;
+    if (def.site === "tvinsider.com") return 30;
+  } else {
+    if (def.site === "tvpassport.com") return -20;
+    if (def.site === "tvinsider.com") return 5;
+    if (def.site === "tvhebdo.com") return 15;
+  }
+
+  if (/(sportsnet|tsn|game\+|the ocho)/i.test(name) && def.site === "tvhebdo.com") {
+    return -40;
+  }
+  if (/(espn|acc|sec|big ten|nba|nfl|nhl|mlb|golf|tennis|willow|tudn|msg|nesn|altitude|yes network|marquee|spectrum sportsnet|fan ?duel|tvg)/i.test(name) &&
+      def.site === "tvpassport.com") {
+    return -10;
+  }
+
+  return 0;
+}
+
+function dedupeAndFillSportsGaps(result: XmltvResult): XmltvResult {
+  for (const [channelId, programmes] of result.programmesByChannel) {
+    const deduped = programmes
+      .sort((a, b) => a.start.getTime() - b.start.getTime())
+      .filter((programme, index, list) => {
+        if (index === 0) return true;
+        const prev = list[index - 1];
+        return !(
+          prev.start.getTime() === programme.start.getTime() &&
+          prev.stop.getTime() === programme.stop.getTime() &&
+          prev.title === programme.title &&
+          prev.description === programme.description
+        );
+      });
+
+    for (let i = 1; i < deduped.length; i++) {
+      const prev = deduped[i - 1];
+      const next = deduped[i];
+      const gapMs = next.start.getTime() - prev.stop.getTime();
+      if (gapMs > 0 && gapMs <= SPORTS_GAP_FILL_MS) {
+        prev.stop = new Date(next.start);
+      }
+    }
+
+    result.programmesByChannel.set(channelId, deduped);
+  }
+
+  return result;
 }
 
 export async function buildIptvOrgFallback(
@@ -235,7 +342,7 @@ export async function buildIptvOrgFallback(
   if (unmatched.length === 0) return undefined;
 
   const repoDir = await ensureRepo();
-  const defs = await loadChannelDefs(repoDir);
+  const defs = await loadChannelDefs(repoDir, GENERAL_SITE_FILES);
   const selected = selectChannels(unmatched, defs);
 
   console.log(`[iptv-org] matched ${selected.size}/${unmatched.length} unmatched channels to upstream site definitions`);
@@ -249,4 +356,39 @@ export async function buildIptvOrgFallback(
     minChannels: 1,
     minProgrammes: 1,
   });
+}
+
+export async function buildIptvOrgSportsOverlay(
+  channels: DebridioChannel[]
+): Promise<XmltvResult | undefined> {
+  const sportsChannels = channels.filter(isSportsChannel);
+  if (sportsChannels.length === 0) return undefined;
+
+  const repoDir = await ensureRepo();
+  const defs = await loadChannelDefs(repoDir, SPORTS_SITE_FILES);
+  const selected = selectChannels(sportsChannels, defs, {
+    sitePriority: sportsSitePriority,
+  });
+
+  console.log(
+    `[iptv-org sports] matched ${selected.size}/${sportsChannels.length} sports channels to overlay sources`
+  );
+  if (selected.size === 0) return undefined;
+
+  const outputDir = path.join(os.tmpdir(), "stream-live-tv-guide-iptv-org-sports");
+  const channelsPath = await writeChannelsXml(selected.values());
+  const currDate = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const guidePath = await runGrab(repoDir, channelsPath, {
+    currDate,
+    days: 3,
+    outputDir,
+  });
+  const xml = await fs.readFile(guidePath, "utf8");
+  const parsed = parseXmltvText(xml, guidePath, "iptv-org sports overlay", {
+    minBytes: 1_000,
+    minChannels: 1,
+    minProgrammes: 1,
+  });
+
+  return dedupeAndFillSportsGaps(parsed);
 }

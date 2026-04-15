@@ -199,6 +199,7 @@ export async function fetchDebridioChannels(
         name: item.name,
         tvgId: item.tvgId ?? "",
         country,
+        genres: item.genres,
       });
     }
   }

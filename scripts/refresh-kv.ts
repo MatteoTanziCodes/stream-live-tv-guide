@@ -14,8 +14,9 @@
 //                           falls back to the hardcoded channels.ts if not set or fetch fails.
 
 import { buildBlob, KV_STATE_KEY } from "../src/kvcache";
+import { DEBRIDIO_CHANNELS } from "../src/channels";
 import { fetchDebridioChannels } from "../src/debridio";
-import { buildIptvOrgFallback } from "./iptv-org";
+import { buildIptvOrgFallback, buildIptvOrgSportsOverlay } from "./iptv-org";
 
 async function putToKV(
   accountId: string,
@@ -100,8 +101,18 @@ async function main() {
     console.log("[refresh-kv] DEBRIDIO_TOKEN not set — using hardcoded channels.ts fallback");
   }
 
+  const channelsForRefresh = dynamicChannels && dynamicChannels.length > 0
+    ? dynamicChannels
+    : [...DEBRIDIO_CHANNELS];
+
+  const extraFeeds: Parameters<typeof buildBlob>[1] = [];
+  const sportsOverlay = await buildIptvOrgSportsOverlay(channelsForRefresh);
+  if (sportsOverlay) {
+    extraFeeds.push({ kind: "sports", result: sportsOverlay });
+  }
+
   console.log("[refresh-kv] building blob from epg.pw feeds…");
-  let blob = await buildBlob(dynamicChannels);
+  let blob = await buildBlob(dynamicChannels, extraFeeds);
 
   if (blob.report.unmatched.length > 0) {
     console.log(
@@ -110,7 +121,10 @@ async function main() {
     );
     const fallback = await buildIptvOrgFallback(blob.report.unmatched);
     if (fallback) {
-      blob = await buildBlob(dynamicChannels, [fallback]);
+      blob = await buildBlob(dynamicChannels, [
+        ...extraFeeds,
+        { kind: "fallback", result: fallback },
+      ]);
       console.log(
         `[refresh-kv] fallback merged: ${blob.report.matched}/${blob.report.debridioChannelCount} matched`
       );
