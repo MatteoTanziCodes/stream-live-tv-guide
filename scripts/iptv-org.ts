@@ -33,7 +33,6 @@ interface SelectedChannelDef extends IptvOrgChannelDef {
 const REPO_DIR = path.join(os.tmpdir(), "iptv-org-epg");
 const GENERATED_DIR = path.join(os.tmpdir(), "stream-live-tv-guide-iptv-org");
 const GENERAL_SITE_FILES = [
-  "sites/tvtv.us/tvtv.us.channels.xml",
   "sites/directv.com/directv.com.channels.xml",
   "sites/tvpassport.com/tvpassport.com.channels.xml",
   "sites/tvguide.com/tvguide.com.channels.xml",
@@ -44,6 +43,7 @@ const GENERAL_SITE_FILES = [
   "sites/ontvtonight.com/ontvtonight.com_us.channels.xml",
   "sites/ontvtonight.com/ontvtonight.com_ca.channels.xml",
   "sites/tvhebdo.com/tvhebdo.com.channels.xml",
+  "sites/tvtv.us/tvtv.us.channels.xml",
 ];
 const SPORTS_SITE_FILES = [
   "sites/tvhebdo.com/tvhebdo.com.channels.xml",
@@ -338,6 +338,29 @@ function sportsSitePriority(target: TargetChannel, def: IptvOrgChannelDef): numb
   return 0;
 }
 
+function fallbackSitePriority(target: TargetChannel, def: IptvOrgChannelDef): number {
+  const name = `${target.name} ${target.tvgId}`.toLowerCase();
+
+  if (def.site === "tvpassport.com") return -20;
+  if (def.site === "tvguide.com") return -10;
+  if (def.site === "tvinsider.com") return 0;
+  if (def.site === "plex.tv") return 5;
+  if (def.site === "pluto.tv") return 10;
+  if (def.site === "streamingtvguides.com") return 15;
+  if (def.site === "ontvtonight.com") return 20;
+  if (def.site === "tvhebdo.com") return target.country === "ca" ? 5 : 20;
+  if (def.site === "directv.com") return 40;
+  if (def.site === "tvtv.us") return 60;
+
+  // Prefer TV Guide for premium rebrands that are exposed there under clean ids.
+  if (/(hbo family|showtime|oxygen|reelz|thriller|max|tcm|telemundo)/i.test(name) &&
+      def.site === "tvguide.com") {
+    return -20;
+  }
+
+  return 0;
+}
+
 function dedupeAndFillSportsGaps(result: XmltvResult): XmltvResult {
   for (const [channelId, programmes] of result.programmesByChannel) {
     const deduped = programmes
@@ -375,7 +398,9 @@ export async function buildIptvOrgFallback(
 
   const repoDir = await ensureRepo();
   const defs = await loadChannelDefs(repoDir, GENERAL_SITE_FILES);
-  const selected = selectChannels(unmatched, defs);
+  const selected = selectChannels(unmatched, defs, {
+    sitePriority: fallbackSitePriority,
+  });
 
   console.log(`[iptv-org] matched ${selected.size}/${unmatched.length} unmatched channels to upstream site definitions`);
   if (selected.size === 0) return undefined;
