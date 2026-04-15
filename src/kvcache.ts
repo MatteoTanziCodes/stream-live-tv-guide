@@ -22,8 +22,8 @@ export const KV_STATE_KEY = "states:v3";
 // How far back / ahead of refresh time to include programmes in the window.
 // Back: covers any long show that started before the cron fired.
 // Ahead: covers enough future slots that even a late cron still has data.
-const WINDOW_BACK_MS  = 4 * 60 * 60 * 1000; // 4 hours
-const WINDOW_AHEAD_MS = 6 * 60 * 60 * 1000; // 6 hours
+export const WINDOW_BACK_MS  = 4 * 60 * 60 * 1000; // 4 hours
+export const WINDOW_AHEAD_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 const EPG_URLS = {
   ca: "https://epg.pw/xmltv/epg_CA.xml",
@@ -69,6 +69,14 @@ function pickCurrentAndNext(
   return { current, next };
 }
 
+export function hasUsableProgrammeWindow(
+  programmes: ParsedProgramme[],
+  nowMs: number
+): boolean {
+  const { current, next } = pickCurrentAndNext(programmes, nowMs);
+  return !!current || (!!next && next.start.getTime() < nowMs + WINDOW_AHEAD_MS);
+}
+
 function toProgram(p: ParsedProgramme): Program {
   return {
     title: p.title,
@@ -91,6 +99,7 @@ export async function buildBlob(
   extraFeeds: AdditionalGuideFeed[] = []
 ): Promise<CachedBlob> {
   const startMs = Date.now();
+  const windowEnd = startMs + WINDOW_AHEAD_MS;
   const debridioChannels = channels && channels.length > 0 ? channels : DEBRIDIO_CHANNELS;
 
   const ca = await fetchAndParseXmltv(EPG_URLS.ca, "epg.pw CA");
@@ -158,6 +167,7 @@ export async function buildBlob(
         const feed = feeds[hit.feedIndex];
         const programmes = feed.result.programmesByChannel.get(hit.channelId);
         if (!programmes || programmes.length === 0) continue;
+        if (!hasUsableProgrammeWindow(programmes, startMs)) continue;
         const kindPenalty =
           feed.kind === "sports"
             ? sportsChannel
@@ -201,7 +211,6 @@ export async function buildBlob(
     // current/next accurately at any point during the refresh interval, not just
     // at the moment the cron ran.
     const windowStart = startMs - WINDOW_BACK_MS;
-    const windowEnd   = startMs + WINDOW_AHEAD_MS;
     const windowProgrammes = programmes
       .filter(p => p.stop.getTime() > windowStart && p.start.getTime() < windowEnd)
       .map(toProgram);

@@ -16,7 +16,7 @@
 import { buildBlob, KV_STATE_KEY } from "../src/kvcache";
 import { DEBRIDIO_CHANNELS } from "../src/channels";
 import { fetchDebridioChannels } from "../src/debridio";
-import { buildIptvOrgFallback, buildIptvOrgSportsOverlay } from "./iptv-org";
+import { buildIptvOrgFallbacks, buildIptvOrgSportsOverlays } from "./iptv-org";
 
 async function putToKV(
   accountId: string,
@@ -106,9 +106,9 @@ async function main() {
     : [...DEBRIDIO_CHANNELS];
 
   const extraFeeds: Parameters<typeof buildBlob>[1] = [];
-  const sportsOverlay = await buildIptvOrgSportsOverlay(channelsForRefresh);
-  if (sportsOverlay) {
-    extraFeeds.push({ kind: "sports", result: sportsOverlay });
+  const sportsOverlays = await buildIptvOrgSportsOverlays(channelsForRefresh);
+  for (const overlay of sportsOverlays) {
+    extraFeeds.push({ kind: "sports", result: overlay });
   }
 
   console.log("[refresh-kv] building blob from epg.pw feeds…");
@@ -119,11 +119,11 @@ async function main() {
       `[refresh-kv] primary pass left ${blob.report.unmatched.length} unmatched channels; ` +
         `trying iptv-org fallback…`
     );
-    const fallback = await buildIptvOrgFallback(blob.report.unmatched);
-    if (fallback) {
+    const fallbacks = await buildIptvOrgFallbacks(blob.report.unmatched);
+    if (fallbacks.length > 0) {
       blob = await buildBlob(dynamicChannels, [
         ...extraFeeds,
-        { kind: "fallback", result: fallback },
+        ...fallbacks.map(result => ({ kind: "fallback" as const, result })),
       ]);
       console.log(
         `[refresh-kv] fallback merged: ${blob.report.matched}/${blob.report.debridioChannelCount} matched`
