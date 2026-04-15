@@ -9,7 +9,7 @@
 // feed in its 10ms per-invocation CPU budget.
 
 import { DEBRIDIO_CHANNELS } from "./channels";
-import { fetchAndParseXmltv, ParsedProgramme } from "./epgpw";
+import { fetchAndParseXmltv, ParsedProgramme, XmltvResult } from "./epgpw";
 import { aliasesFor, debridioAliases } from "./matcher";
 import { CachedBlob, ChannelState, DebridioChannel, MatchReport, Program } from "./types";
 
@@ -28,6 +28,16 @@ const EPG_URLS = {
   ca: "https://epg.pw/xmltv/epg_CA.xml",
   usa: "https://epg.pw/xmltv/epg_US.xml",
 } as const;
+
+interface FeedDescriptor {
+  countryHint?: "ca" | "usa";
+  result: XmltvResult;
+}
+
+interface FeedCandidate {
+  channelId: string;
+  feedIndex: number;
+}
 
 // Pick the current and next programmes for a sorted programme list.
 // Lists are pre-sorted ASC by start time, so we can early-exit as soon as
@@ -68,33 +78,42 @@ function toProgram(p: ParsedProgramme): Program {
 //
 // If `channels` is provided (fetched dynamically from Debridio at cron time),
 // it is used in place of the hardcoded DEBRIDIO_CHANNELS fallback.
-export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlob> {
+export async function buildBlob(
+  channels?: DebridioChannel[],
+  extraFeeds: XmltvResult[] = []
+): Promise<CachedBlob> {
   const startMs = Date.now();
   const debridioChannels = channels && channels.length > 0 ? channels : DEBRIDIO_CHANNELS;
 
   const ca = await fetchAndParseXmltv(EPG_URLS.ca, "epg.pw CA");
   const us = await fetchAndParseXmltv(EPG_URLS.usa, "epg.pw US");
+  const feeds: FeedDescriptor[] = [
+    { countryHint: "ca", result: ca },
+    { countryHint: "usa", result: us },
+    ...extraFeeds.map(result => ({ result })),
+  ];
 
-  // Build the alias → (feed, channelId) lookup table from both feeds.
-  // First write wins, so CA's entries take precedence for any shared channel
-  // name. We iterate CA first because it's smaller and easier to sanity-check.
-  const aliasToChannel = new Map<string, { feed: "ca" | "usa"; channelId: string }>();
+  // Build the alias → candidate channels lookup table from all feeds.
+  // Primary epg.pw feeds come first; extra feeds act as fallback candidates.
+  const aliasToChannel = new Map<string, FeedCandidate[]>();
   const ingestFeed = (
-    feed: "ca" | "usa",
+    feedIndex: number,
     channelDisplayNames: Map<string, string[]>
   ) => {
     for (const [channelId, names] of channelDisplayNames) {
-      for (const name of names) {
-        for (const alias of aliasesFor(name)) {
-          if (!aliasToChannel.has(alias)) {
-            aliasToChannel.set(alias, { feed, channelId });
-          }
+      const channelBase = channelId.replace(/@.*$/, "");
+      const channelBare = channelBase.replace(/\.(?:ca|us|usa)$/i, "");
+      for (const aliasSource of [channelId, channelBase, channelBare, ...names]) {
+        for (const alias of aliasesFor(aliasSource)) {
+          const existing = aliasToChannel.get(alias);
+          const candidate = { feedIndex, channelId };
+          if (!existing) aliasToChannel.set(alias, [candidate]);
+          else if (!existing.some(e => e.feedIndex === feedIndex && e.channelId === channelId)) existing.push(candidate);
         }
       }
     }
   };
-  ingestFeed("ca", ca.channelDisplayNames);
-  ingestFeed("usa", us.channelDisplayNames);
+  feeds.forEach((feed, index) => ingestFeed(index, feed.result.channelDisplayNames));
 
   // For each Debridio channel, pick the best epg.pw match (preferring the
   // same-country feed) and record its current+next programme state under every
@@ -112,15 +131,26 @@ export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlo
 
     // Find the best match. Preference order: same-country first, then other.
     const preferredFeed: "ca" | "usa" = ch.country === "ca" ? "ca" : "usa";
-    let best: { feed: "ca" | "usa"; channelId: string } | undefined;
+    let best: FeedCandidate | undefined;
+    let bestScore = Number.POSITIVE_INFINITY;
+    const seenCandidates = new Set<string>();
     for (const a of debAliases) {
-      const hit = aliasToChannel.get(a);
-      if (!hit) continue;
-      if (hit.feed === preferredFeed) {
-        best = hit;
-        break;
+      const hits = aliasToChannel.get(a);
+      if (!hits) continue;
+      for (const hit of hits) {
+        const dedupeKey = `${hit.feedIndex}:${hit.channelId}`;
+        if (seenCandidates.has(dedupeKey)) continue;
+        seenCandidates.add(dedupeKey);
+
+        const feed = feeds[hit.feedIndex];
+        const score =
+          (feed.countryHint === preferredFeed ? 0 : feed.countryHint ? 1 : 2) * 1000 +
+          hit.feedIndex;
+        if (score < bestScore) {
+          best = hit;
+          bestScore = score;
+        }
       }
-      if (!best) best = hit; // remember non-preferred match but keep looking
     }
 
     if (!best) {
@@ -134,7 +164,7 @@ export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlo
     }
     matched++;
 
-    const feedResult = best.feed === "ca" ? ca : us;
+    const feedResult = feeds[best.feedIndex].result;
     const programmes = feedResult.programmesByChannel.get(best.channelId) ?? [];
 
     // Reporting: snapshot current/next at refresh time for /__status coverage stats.
@@ -168,7 +198,7 @@ export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlo
   const report: MatchReport = {
     refreshedAt: new Date().toISOString(),
     durationMs: Date.now() - startMs,
-    sources: [ca.stats, us.stats],
+    sources: feeds.map(feed => feed.result.stats),
     debridioChannelCount: debridioChannels.length,
     matched,
     matchedWithCurrent,
@@ -179,16 +209,18 @@ export async function buildBlob(channels?: DebridioChannel[]): Promise<CachedBlo
   };
 
   console.log(
-    `[buildBlob] refresh ok: ${matched}/${DEBRIDIO_CHANNELS.length} matched ` +
+    `[buildBlob] refresh ok: ${matched}/${debridioChannels.length} matched ` +
       `(current=${matchedWithCurrent} nextOnly=${matchedWithOnlyNext} ` +
       `empty=${matchedWithNothing}), ${report.indexKeys} index keys, ` +
       `${report.durationMs}ms`
   );
-  if (ca.stats.completenessErrors.length) {
-    console.warn("[buildBlob] CA completeness issues:", ca.stats.completenessErrors);
-  }
-  if (us.stats.completenessErrors.length) {
-    console.warn("[buildBlob] US completeness issues:", us.stats.completenessErrors);
+  for (const feed of feeds) {
+    if (feed.result.stats.completenessErrors.length > 0) {
+      console.warn(
+        `[buildBlob] ${feed.result.stats.name} completeness issues:`,
+        feed.result.stats.completenessErrors
+      );
+    }
   }
 
   return { report, states };

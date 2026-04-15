@@ -15,6 +15,7 @@
 
 import { buildBlob, KV_STATE_KEY } from "../src/kvcache";
 import { fetchDebridioChannels } from "../src/debridio";
+import { buildIptvOrgFallback } from "./iptv-org";
 
 async function putToKV(
   accountId: string,
@@ -100,7 +101,23 @@ async function main() {
   }
 
   console.log("[refresh-kv] building blob from epg.pw feeds…");
-  const blob = await buildBlob(dynamicChannels);
+  let blob = await buildBlob(dynamicChannels);
+
+  if (blob.report.unmatched.length > 0) {
+    console.log(
+      `[refresh-kv] primary pass left ${blob.report.unmatched.length} unmatched channels; ` +
+        `trying iptv-org fallback…`
+    );
+    const fallback = await buildIptvOrgFallback(blob.report.unmatched);
+    if (fallback) {
+      blob = await buildBlob(dynamicChannels, [fallback]);
+      console.log(
+        `[refresh-kv] fallback merged: ${blob.report.matched}/${blob.report.debridioChannelCount} matched`
+      );
+    } else {
+      console.log("[refresh-kv] iptv-org fallback did not produce any additional guide data");
+    }
+  }
   const body = JSON.stringify(blob);
 
   console.log(

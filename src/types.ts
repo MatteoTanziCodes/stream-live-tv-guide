@@ -28,7 +28,7 @@ export interface ChannelState {
 // Per-source stats — captured during every scheduled refresh so we can prove the
 // XMLTV fetch was complete and the parse didn't silently drop data.
 export interface SourceStats {
-  name: "epg.pw CA" | "epg.pw US";
+  name: string;
   url: string;
   fetchedAt: string;
   httpStatus: number;

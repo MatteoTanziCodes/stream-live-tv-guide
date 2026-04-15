@@ -24,6 +24,58 @@ function normalize(s: string): string {
     .replace(/[^a-z0-9]+/g, "");
 }
 
+const RESOLUTION_RE = /\b(?:HD|SD|UHD|FHD|4K)\b/gi;
+const DIRECTION_RE = /\b(?:East|West|Eastern|Western|North|South|Central|Pacific|Mountain|National)\b/gi;
+const MEDIUM_RE = /\b(?:Channel|Network|Television|TV|Stream|Feed)\b/gi;
+
+function addVariant(set: Set<string>, value: string): void {
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  if (trimmed) set.add(trimmed);
+}
+
+function extractDelimited(raw: string, re: RegExp): string[] {
+  const out: string[] = [];
+  for (const match of raw.matchAll(re)) {
+    const inner = match[1]?.trim();
+    if (inner) out.push(inner);
+  }
+  return out;
+}
+
+function addSynonymVariants(set: Set<string>, raw: string): void {
+  const pairs: Array<[RegExp, string]> = [
+    [/\bHGTV\b/gi, "Home and Garden Television"],
+    [/\bHome\s+(?:&|and)\s+Garden(?:\s+Television)?\b/gi, "HGTV"],
+    [/\bID\b/gi, "Investigation Discovery"],
+    [/\bInvestigation Discovery\b/gi, "ID"],
+    [/\bNat(?:ional)?\s+Geo(?:graphic)?\s+Wild\b/gi, "National Geographic Wild"],
+    [/\bNational Geographic Wild\b/gi, "Nat Geo Wild"],
+    [/\bOWN\b/gi, "Oprah Winfrey Network"],
+    [/\bOprah Winfrey Network\b/gi, "OWN"],
+    [/\bFX Movie\b/gi, "FXM"],
+    [/\bFXM\b/gi, "FX Movie"],
+    [/\bEPIX\b/gi, "MGM Plus"],
+    [/\bMGM\s*\+\b/gi, "EPIX"],
+    [/\bViceland\b/gi, "Vice"],
+    [/\bVice\b/gi, "Viceland"],
+    [/\bTVG\b/gi, "FanDuel TV"],
+    [/\bFanDuel TV\b/gi, "TVG"],
+    [/\bLifetime Movies\b/gi, "Lifetime Movie Network"],
+    [/\bLifetime Movie Network\b/gi, "Lifetime Movies"],
+    [/\bHallmark Movies\s+(?:&|and)\s+Mysteries\b/gi, "Hallmark Mystery"],
+    [/\bHallmark Mystery\b/gi, "Hallmark Movies and Mysteries"],
+    [/\bBBC World News\b/gi, "BBC News"],
+    [/\bBBC News\b/gi, "BBC World News"],
+    [/\bGame\+\b/gi, "Game Plus"],
+    [/\bGame Plus\b/gi, "Game+"],
+  ];
+
+  for (const [re, replacement] of pairs) {
+    re.lastIndex = 0;
+    if (re.test(raw)) addVariant(set, raw.replace(re, replacement));
+  }
+}
+
 // Generate plausible spelling variants of a name, before normalization.
 // Each variant feeds into `normalize()` to form an alias. The goal is for
 // "Disney Jr." (Debridio) and "Disney Junior" (epg.pw) to share at least one
@@ -31,33 +83,49 @@ function normalize(s: string): string {
 function variantsOf(raw: string): string[] {
   const v = new Set<string>([raw]);
 
+  // Pull out the text inside delimiters as standalone aliases:
+  // "Cable Pulse 24 (CP24) HD" -> "CP24", "[CPAC] ..." -> "CPAC".
+  for (const inner of extractDelimited(raw, /\(([^)]+)\)/g)) addVariant(v, inner);
+  for (const inner of extractDelimited(raw, /\[([^\]]+)\]/g)) addVariant(v, inner);
+
   // Drop parenthesised qualifiers: "Sportsnet (East)" → "Sportsnet".
   const noParens = raw.replace(/\s*\([^)]*\)\s*/g, " ").trim();
-  v.add(noParens);
+  addVariant(v, noParens);
+
+  // Drop bracketed qualifiers: "[CPAC] Cable Public Affairs Channel HD" → "Cable Public Affairs Channel HD".
+  const noBrackets = raw.replace(/\s*\[[^\]]*\]\s*/g, " ").trim();
+  addVariant(v, noBrackets);
 
   // Drop resolution markers: "ABC HD" → "ABC".
-  const noRes = raw.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "").trim();
-  v.add(noRes);
-  v.add(noParens.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "").trim());
+  const noRes = raw.replace(RESOLUTION_RE, "").trim();
+  addVariant(v, noRes);
+  addVariant(v, noParens.replace(RESOLUTION_RE, "").trim());
+  addVariant(v, noBrackets.replace(RESOLUTION_RE, "").trim());
 
   // Drop directional qualifiers: "Fox East" → "Fox", "ABC West" → "ABC".
   // Feeds often append East/West for time-zone variants of the same network.
-  const noDir = raw.replace(/\b(?:East|West|Eastern|Western|North|South)\b/gi, "").trim();
-  v.add(noDir);
-  v.add(noDir.replace(/\b(?:HD|SD|UHD|FHD|4K)\b/gi, "").trim());
+  const noDir = raw.replace(DIRECTION_RE, "").trim();
+  addVariant(v, noDir);
+  addVariant(v, noDir.replace(RESOLUTION_RE, "").trim());
 
   // Drop generic medium words: "Fox News Channel" → "Fox News",
   // "USA Network" → "USA", "CBC Television" → "CBC".
-  const noMedium = raw.replace(/\b(?:Channel|Network|Television)\b/gi, "").trim();
-  v.add(noMedium);
-  v.add(noMedium.replace(/\b(?:East|West|Eastern|Western|North|South)\b/gi, "").trim());
+  const noMedium = raw.replace(MEDIUM_RE, "").trim();
+  addVariant(v, noMedium);
+  addVariant(v, noMedium.replace(DIRECTION_RE, "").trim());
+  addVariant(v, noMedium.replace(RESOLUTION_RE, "").trim());
+  addVariant(v, noMedium.replace(DIRECTION_RE, "").replace(RESOLUTION_RE, "").trim());
+  addVariant(v, raw.replace(DIRECTION_RE, "").replace(MEDIUM_RE, "").replace(RESOLUTION_RE, "").trim());
 
   // Drop leading "The": "The CW" → "CW".
-  v.add(raw.replace(/^The\s+/i, "").trim());
+  addVariant(v, raw.replace(/^The\s+/i, "").trim());
 
   // Bidirectional Jr <-> Junior — different feeds prefer different forms.
-  v.add(raw.replace(/\bJr\.?\b/gi, "Junior"));
-  v.add(raw.replace(/\bJunior\b/gi, "Jr"));
+  addVariant(v, raw.replace(/\bJr\.?\b/gi, "Junior"));
+  addVariant(v, raw.replace(/\bJunior\b/gi, "Jr"));
+
+  addSynonymVariants(v, raw);
+  for (const cur of [...v]) addSynonymVariants(v, cur);
 
   return [...v].filter(s => s.length > 0);
 }

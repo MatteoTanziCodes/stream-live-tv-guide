@@ -19,7 +19,7 @@ export interface ParsedProgramme {
   description?: string;
 }
 
-export interface EpgpwResult {
+export interface XmltvResult {
   stats: SourceStats;
   // epg.pw channel id → all display-names from its <channel> block. Multiple
   // names are common ("TSN 1", "TSN One", "The Sports Network 1") and the
@@ -27,6 +27,14 @@ export interface EpgpwResult {
   channelDisplayNames: Map<string, string[]>;
   // epg.pw channel id → programmes, pre-sorted by start ASC.
   programmesByChannel: Map<string, ParsedProgramme[]>;
+}
+
+export type EpgpwResult = XmltvResult;
+
+export interface XmltvParseOptions {
+  minBytes?: number;
+  minChannels?: number;
+  minProgrammes?: number;
 }
 
 // XMLTV time format: "20260414120000 -0500" → Date
@@ -198,8 +206,9 @@ function drainBuffer(
 
 export async function fetchAndParseXmltv(
   url: string,
-  sourceName: SourceStats["name"]
-): Promise<EpgpwResult> {
+  sourceName: SourceStats["name"],
+  options: XmltvParseOptions = {}
+): Promise<XmltvResult> {
   const stats: SourceStats = {
     name: sourceName,
     url,
@@ -283,11 +292,30 @@ export async function fetchAndParseXmltv(
   drainBuffer(buffer, stats, channelDisplayNames, programmesByChannel);
   if (buffer.includes("</tv>")) sawCloseRoot = true;
 
+  finalizeStats(stats, channelDisplayNames, programmesByChannel, {
+    minBytes: options.minBytes ?? 500_000,
+    minChannels: options.minChannels ?? 50,
+    minProgrammes: options.minProgrammes ?? 1000,
+    sawOpenRoot,
+    sawCloseRoot,
+  });
+
+  return { stats, channelDisplayNames, programmesByChannel };
+}
+
+function finalizeStats(
+  stats: SourceStats,
+  channelDisplayNames: Map<string, string[]>,
+  programmesByChannel: Map<string, ParsedProgramme[]>,
+  opts: Required<XmltvParseOptions> & { sawOpenRoot: boolean; sawCloseRoot: boolean }
+): void {
+  const { minBytes, minChannels, minProgrammes, sawOpenRoot, sawCloseRoot } = opts;
+
   // Completeness gate 1: body must be non-trivially sized. epg.pw country feeds
   // are typically 5-30MB; anything <500KB is almost certainly truncated or wrong.
-  if (stats.bytes < 500_000) {
+  if (stats.bytes < minBytes) {
     stats.completenessErrors.push(
-      `response body unexpectedly small (${stats.bytes} bytes; expected >=500KB)`
+      `response body unexpectedly small (${stats.bytes} bytes; expected >=${minBytes}B)`
     );
   }
   // Completeness gate 2: must actually be XMLTV.
@@ -309,14 +337,14 @@ export async function fetchAndParseXmltv(
   // Completeness gate 4: sanity-check volumes. Real CA/US feeds have 500+
   // channels and tens of thousands of programmes. If we're far below that,
   // either the parse broke or the upstream gave us a shell file.
-  if (stats.channelsFound < 50) {
+  if (stats.channelsFound < minChannels) {
     stats.completenessErrors.push(
-      `channelsFound=${stats.channelsFound} is unexpectedly low (expected >=50)`
+      `channelsFound=${stats.channelsFound} is unexpectedly low (expected >=${minChannels})`
     );
   }
-  if (stats.programmesFound < 1000) {
+  if (stats.programmesFound < minProgrammes) {
     stats.completenessErrors.push(
-      `programmesFound=${stats.programmesFound} is unexpectedly low (expected >=1000)`
+      `programmesFound=${stats.programmesFound} is unexpectedly low (expected >=${minProgrammes})`
     );
   }
   // Completeness gate 5: flag if a big chunk of programmes silently dropped.
@@ -332,6 +360,40 @@ export async function fetchAndParseXmltv(
       `${(dropRate * 100).toFixed(1)}% of programmes dropped during parse (>5% threshold)`
     );
   }
+}
 
+export function parseXmltvText(
+  text: string,
+  url: string,
+  sourceName: SourceStats["name"],
+  options: XmltvParseOptions = {}
+): XmltvResult {
+  const stats: SourceStats = {
+    name: sourceName,
+    url,
+    fetchedAt: new Date().toISOString(),
+    httpStatus: 200,
+    bytes: new TextEncoder().encode(text).byteLength,
+    channelsFound: 0,
+    programmesFound: 0,
+    channelsWithoutDisplayName: 0,
+    programmesWithUnparseableTime: 0,
+    programmesWithoutChannel: 0,
+    programmesWithoutTitle: 0,
+    completenessErrors: [],
+  };
+  const channelDisplayNames = new Map<string, string[]>();
+  const programmesByChannel = new Map<string, ParsedProgramme[]>();
+  const cleaned = text.replace(/<!--[\s\S]*?-->/g, "");
+  const sawOpenRoot = cleaned.includes("<tv");
+  const sawCloseRoot = cleaned.includes("</tv>");
+  drainBuffer(cleaned, stats, channelDisplayNames, programmesByChannel);
+  finalizeStats(stats, channelDisplayNames, programmesByChannel, {
+    minBytes: options.minBytes ?? 1_000,
+    minChannels: options.minChannels ?? 1,
+    minProgrammes: options.minProgrammes ?? 1,
+    sawOpenRoot,
+    sawCloseRoot,
+  });
   return { stats, channelDisplayNames, programmesByChannel };
 }

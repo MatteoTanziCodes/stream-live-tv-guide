@@ -10,6 +10,14 @@ export interface Env {
   DEBRIDIO_BASE?: string;
 }
 
+interface StremioManifest {
+  id?: string;
+  name?: string;
+  description?: string;
+  behaviorHints?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 function enhanceItem<T extends ItemLike & { description?: string }>(
   item: T,
   states: Record<string, ChannelState>
@@ -20,12 +28,37 @@ function enhanceItem<T extends ItemLike & { description?: string }>(
   return { ...item, description: blurb };
 }
 
-// Walk a JSON response body and rewrite description on any recognised items.
-// Only touches `metas[]` (catalog response) and `meta` (single-meta response).
-// `streams[]` is intentionally left alone — Debridio's stream descriptions
-// ("A1X Media", "TVPass HD") are identifiers, not TV listings.
-function rewriteBody(data: unknown, states: Record<string, ChannelState>): unknown {
+function rewriteManifest(data: unknown, host: string): unknown {
   if (!data || typeof data !== "object") return data;
+  const manifest = data as StremioManifest;
+  const name = typeof manifest.name === "string" && manifest.name.trim()
+    ? `${manifest.name} + Live Guide`
+    : "Debridio TV + Live Guide";
+  return {
+    ...manifest,
+    name,
+    description:
+      `Proxy via ${host} with live Now/Up next guide data for supported CA/US channels.`,
+    behaviorHints: {
+      ...(manifest.behaviorHints ?? {}),
+      configurable: false,
+    },
+  };
+}
+
+// Walk a JSON response body and rewrite manifest metadata plus descriptions on
+// recognised items. `streams[]` is intentionally left alone — Debridio's stream
+// descriptions ("A1X Media", "TVPass HD") are identifiers, not TV listings.
+function rewriteBody(
+  data: unknown,
+  states: Record<string, ChannelState>,
+  forwardPath: string,
+  host: string
+): unknown {
+  if (!data || typeof data !== "object") return data;
+  if (forwardPath === "/manifest.json") {
+    return rewriteManifest(data, host);
+  }
   const obj = data as Record<string, unknown>;
   if (Array.isArray(obj.metas)) {
     obj.metas = (obj.metas as ItemLike[]).map(m => enhanceItem(m, states));
@@ -162,10 +195,19 @@ async function handleProxy(request: Request, env: Env): Promise<Response> {
     try {
       const json = JSON.parse(body);
       const states = await loadAllStates(env.CHANNEL_STATE);
-      const rewritten = rewriteBody(json, states);
+      const rewritten = rewriteBody(json, states, result.forwardPath, url.host);
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        ...CORS_HEADERS,
+      };
+      if (result.forwardPath === "/manifest.json") {
+        headers["cache-control"] = "no-store, no-cache, max-age=0, must-revalidate";
+        headers.pragma = "no-cache";
+        headers.expires = "0";
+      }
       return new Response(JSON.stringify(rewritten), {
         status: upstream.status,
-        headers: { "content-type": "application/json", ...CORS_HEADERS },
+        headers,
       });
     } catch {
       // Upstream said JSON but gave us garbage — pass through raw.
@@ -235,7 +277,7 @@ function landingPage(host: string): Response {
 </head>
 <body>
 <h1>stream-live-tv-guide</h1>
-<p class="muted">A proxy for the Debridio TV Stremio addon that fills in live "now playing" descriptions for Canadian and US TV channels, sourced from epg.pw XMLTV feeds.</p>
+<p class="muted">A proxy for the Debridio TV Stremio addon that fills in live "now playing" descriptions for Canadian and US TV channels, sourced from epg.pw with targeted iptv-org fallback guides for channels epg.pw misses.</p>
 
 <h2>How to install</h2>
 <ol>
@@ -250,7 +292,7 @@ function landingPage(host: string): Response {
 </ol>
 
 <h2>Status / debug</h2>
-<p>Call <code>/__status</code> on this worker to see the last refresh's coverage report (how many Debridio channels were matched against epg.pw data, completeness errors per feed, list of unmatched channels).</p>
+<p>Call <code>/__status</code> on this worker to see the last refresh's coverage report (how many Debridio channels were matched, completeness errors per feed, list of unmatched channels).</p>
 </body>
 </html>`;
   return new Response(html, {
